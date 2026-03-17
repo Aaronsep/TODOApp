@@ -324,7 +324,7 @@ export default function App() {
             draggingTaskId === task.id
               ? "border-[#8b94a5]/75 bg-white/[0.06]"
               : task.important && !task.completed
-                ? "border-[#8b5b63]/34 bg-[#8b5b63]/[0.06] hover:border-[#98656f]/44 hover:bg-[#8b5b63]/[0.08]"
+                ? "border-[#bb6a74]/82 bg-[linear-gradient(180deg,rgba(173,72,88,0.18),rgba(108,34,46,0.13))] shadow-[inset_0_1px_0_rgba(255,196,204,0.05)] hover:border-[#ca7883]/88 hover:bg-[linear-gradient(180deg,rgba(186,82,99,0.22),rgba(121,39,52,0.16))]"
                 : task.completed
                   ? "border-[#59606d]/38 bg-[#8d96a3]/[0.08] hover:border-[#646d7b]/50 hover:bg-[#8d96a3]/[0.11]"
                   : "border-[#667080]/48 bg-white/[0.03] hover:border-[#7d8695]/55 hover:bg-white/[0.05]"
@@ -355,7 +355,7 @@ export default function App() {
           </span>
           {task.important && !task.completed ? (
             <span
-              className="h-2.5 w-2.5 shrink-0 rounded-full bg-[#bf717c]/78 shadow-[0_0_0_4px_rgba(191,113,124,0.08)]"
+              className="h-2.5 w-2.5 shrink-0 rounded-full bg-[#df808d] shadow-[0_0_0_5px_rgba(223,128,141,0.18)]"
               aria-label="Tarea prioritaria"
               title="Tarea prioritaria"
             />
@@ -485,8 +485,9 @@ export default function App() {
                 {contextTask.important ? "Quitar importante" : "Marcar importante"}
               </span>
               <span className="text-[#f5be4f]/80">!</span>
-            </button>
-          ) : null}
+              </button>
+            ) : null}
+          <div className="my-1 border-t border-white/8" />
           <button
             type="button"
             onClick={() => void deleteTask(contextTask.id)}
