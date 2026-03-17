@@ -15,9 +15,15 @@ const appWindow = getCurrentWebviewWindow();
 
 type TaskSection = "pending" | "completed";
 type ContextMenuState = {
-  taskId: string;
+  type: "task" | "completed-section";
+  taskId?: string;
   x: number;
   y: number;
+} | null;
+type DeleteConfirmState = {
+  taskId: string;
+  text: string;
+  mode: "single" | "completed-bulk";
 } | null;
 
 function createTask(text: string): Task {
@@ -46,6 +52,7 @@ export default function App() {
   const [draggingTaskId, setDraggingTaskId] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const [completedCollapsed, setCompletedCollapsed] = useState(false);
+  const [deleteConfirm, setDeleteConfirm] = useState<DeleteConfirmState>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -101,6 +108,10 @@ export default function App() {
           setContextMenu(null);
           return;
         }
+        if (deleteConfirm) {
+          setDeleteConfirm(null);
+          return;
+        }
         event.preventDefault();
         await invoke("hide_current_window");
       }
@@ -111,7 +122,7 @@ export default function App() {
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [contextMenu]);
+  }, [contextMenu, deleteConfirm]);
 
   useEffect(() => {
     if (!contextMenu) {
@@ -189,6 +200,39 @@ export default function App() {
   const deleteTask = async (taskId: string) => {
     const nextTasks = tasks.filter((task) => task.id !== taskId);
     setContextMenu(null);
+    setDeleteConfirm(null);
+    await persistTasks(nextTasks);
+    window.setTimeout(() => inputRef.current?.focus(), 10);
+  };
+
+  const requestDeleteTask = (taskId: string) => {
+    const task = tasks.find((item) => item.id === taskId);
+    if (!task) {
+      return;
+    }
+    setContextMenu(null);
+    setDeleteConfirm({
+      taskId,
+      text: task.text,
+      mode: "single",
+    });
+  };
+
+  const requestDeleteCompletedTasks = () => {
+    if (completedTasks.length === 0) {
+      return;
+    }
+    setContextMenu(null);
+    setDeleteConfirm({
+      taskId: "__completed_bulk__",
+      text: `${completedTasks.length} tareas completadas`,
+      mode: "completed-bulk",
+    });
+  };
+
+  const deleteCompletedTasks = async () => {
+    const nextTasks = tasks.filter((task) => !task.completed);
+    setDeleteConfirm(null);
     await persistTasks(nextTasks);
     window.setTimeout(() => inputRef.current?.focus(), 10);
   };
@@ -212,6 +256,27 @@ export default function App() {
     setContextMenu(null);
     await persistTasks(rebuildTasks(nextPendingTasks, nextCompletedTasks));
     window.setTimeout(() => inputRef.current?.focus(), 10);
+  };
+
+  const markTaskAsPending = async (taskId: string) => {
+    const completedTask = completedTasks.find((task) => task.id === taskId);
+    if (!completedTask) {
+      return;
+    }
+
+    const importantTasks = pendingTasks.filter((task) => task.important);
+    const regularTasks = pendingTasks.filter((task) => !task.important);
+    const nextPendingTasks = [
+      ...importantTasks,
+      {
+        ...completedTask,
+        completed: false,
+      },
+      ...regularTasks,
+    ];
+    const nextCompletedTasks = completedTasks.filter((task) => task.id !== taskId);
+
+    await persistTasks(rebuildTasks(nextPendingTasks, nextCompletedTasks));
   };
 
   const toggleTaskImportant = async (taskId: string) => {
@@ -292,6 +357,22 @@ export default function App() {
     ? tasks.find((task) => task.id === contextMenu.taskId) ?? null
     : null;
 
+  const markAllCompletedAsPending = async () => {
+    if (completedTasks.length === 0) {
+      return;
+    }
+
+    const importantTasks = pendingTasks.filter((task) => task.important);
+    const regularTasks = pendingTasks.filter((task) => !task.important);
+    const restoredTasks = completedTasks.map((task) => ({
+      ...task,
+      completed: false,
+    }));
+
+    setContextMenu(null);
+    await persistTasks([...importantTasks, ...restoredTasks, ...regularTasks]);
+  };
+
   const renderTaskList = (section: TaskSection, sectionTasks: Task[]) => (
     <div className="space-y-2">
       {sectionTasks.map((task) => (
@@ -309,6 +390,7 @@ export default function App() {
           onContextMenu={(event) => {
             event.preventDefault();
             setContextMenu({
+              type: "task",
               taskId: task.id,
               x: event.clientX,
               y: event.clientY,
@@ -326,29 +408,31 @@ export default function App() {
               : task.important && !task.completed
                 ? "border-[#bb6a74]/82 bg-[linear-gradient(180deg,rgba(173,72,88,0.18),rgba(108,34,46,0.13))] shadow-[inset_0_1px_0_rgba(255,196,204,0.05)] hover:border-[#ca7883]/88 hover:bg-[linear-gradient(180deg,rgba(186,82,99,0.22),rgba(121,39,52,0.16))]"
                 : task.completed
-                  ? "border-[#59606d]/38 bg-[#8d96a3]/[0.08] hover:border-[#646d7b]/50 hover:bg-[#8d96a3]/[0.11]"
+                  ? "border-[#5f6671]/52 bg-[linear-gradient(180deg,rgba(112,120,132,0.12),rgba(83,90,101,0.09))] hover:border-[#717987]/58 hover:bg-[linear-gradient(180deg,rgba(122,130,143,0.14),rgba(88,96,108,0.11))]"
                   : "border-[#667080]/48 bg-white/[0.03] hover:border-[#7d8695]/55 hover:bg-white/[0.05]"
           } select-none`}
         >
           <button
             type="button"
             onClick={() => {
-              if (!task.completed) {
+              if (task.completed) {
+                void markTaskAsPending(task.id);
+              } else {
                 void markTaskAsCompleted(task.id);
               }
             }}
             className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border text-[10px] transition ${
               task.completed
-                ? "border-[#f5be4f]/55 bg-[#f5be4f]/14 text-[#f5be4f]"
+                ? "border-transparent bg-[#8f98a6] text-[12px] font-black text-[#20262e]"
                 : "border-[#6b7382]/45 bg-black/20 text-transparent hover:border-[#f5be4f]/55 hover:bg-[#f5be4f]/12 hover:text-[#f5be4f]"
             }`}
-            aria-label={task.completed ? "Tarea completada" : "Completar tarea"}
+            aria-label={task.completed ? "Regresar tarea a pendientes" : "Completar tarea"}
           >
             ✓
           </button>
           <span
             className={`flex-1 text-sm leading-6 ${
-              task.completed ? "text-[#a7afbc]/66 line-through decoration-[#9ea7b5]/55" : "text-white/88"
+              task.completed ? "text-[#8d96a3] line-through decoration-[#8d96a3]" : "text-white/88"
             }`}
           >
             {task.text}
@@ -444,6 +528,14 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setCompletedCollapsed((value) => !value)}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    setContextMenu({
+                      type: "completed-section",
+                      x: event.clientX,
+                      y: event.clientY,
+                    });
+                  }}
                   className="flex items-center gap-2 rounded-xl bg-white/[0.07] px-3 py-2 text-sm text-white/82 transition hover:bg-white/[0.1]"
                 >
                   <span className="text-[12px] text-white/70">
@@ -458,7 +550,7 @@ export default function App() {
           </div>
         </div>
       </section>
-      {contextMenu && contextTask ? (
+      {contextMenu && contextMenu.type === "task" && contextTask ? (
         <div
           ref={menuRef}
           className="fixed z-50 min-w-[180px] overflow-hidden rounded-2xl border border-[#667080]/55 bg-[rgba(18,22,30,0.94)] p-1.5 shadow-[0_20px_45px_rgba(0,0,0,0.45)] backdrop-blur-[24px]"
@@ -484,18 +576,95 @@ export default function App() {
               <span>
                 {contextTask.important ? "Quitar importante" : "Marcar importante"}
               </span>
-              <span className="text-[#f5be4f]/80">!</span>
+                <span className="text-[#f5be4f]/80">!</span>
               </button>
             ) : null}
+          <button
+            type="button"
+            onClick={() =>
+              void (contextTask.completed
+                ? markTaskAsPending(contextTask.id)
+                : markTaskAsCompleted(contextTask.id))
+            }
+            className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-sm text-white/84 transition hover:bg-white/[0.06]"
+          >
+            <span>
+              {contextTask.completed ? "Marcar incompleta" : "Marcar completada"}
+            </span>
+            <span>{contextTask.completed ? "↺" : "✓"}</span>
+          </button>
           <div className="my-1 border-t border-white/8" />
           <button
             type="button"
-            onClick={() => void deleteTask(contextTask.id)}
+            onClick={() => requestDeleteTask(contextTask.id)}
             className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-sm text-[#ffb4b4] transition hover:bg-white/[0.06]"
           >
             <span>Eliminar tarea</span>
             <span>⌫</span>
           </button>
+        </div>
+      ) : null}
+      {contextMenu && contextMenu.type === "completed-section" ? (
+        <div
+          ref={menuRef}
+          className="fixed z-50 min-w-[220px] overflow-hidden rounded-2xl border border-[#667080]/55 bg-[rgba(18,22,30,0.94)] p-1.5 shadow-[0_20px_45px_rgba(0,0,0,0.45)] backdrop-blur-[24px]"
+          style={{
+            left: Math.min(contextMenu.x, window.innerWidth - 236),
+            top: Math.min(contextMenu.y, window.innerHeight - 132),
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => void markAllCompletedAsPending()}
+            className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-sm text-white/84 transition hover:bg-white/[0.06]"
+          >
+            <span>Marcar todas incompletas</span>
+            <span>↺</span>
+          </button>
+          <div className="my-1 border-t border-white/8" />
+          <button
+            type="button"
+            onClick={() => requestDeleteCompletedTasks()}
+            className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-sm text-[#ffb4b4] transition hover:bg-white/[0.06]"
+          >
+            <span>Eliminar completadas</span>
+            <span>⌫</span>
+          </button>
+        </div>
+      ) : null}
+      {deleteConfirm ? (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/28 px-4 backdrop-blur-[6px]">
+          <div className="w-full max-w-[320px] rounded-[24px] border border-[#667080]/45 bg-[rgba(18,22,30,0.96)] p-4 shadow-[0_24px_60px_rgba(0,0,0,0.45)]">
+            <p className="text-sm font-medium text-white">Eliminar tarea</p>
+            <p className="mt-2 text-sm leading-6 text-white/62">
+              {deleteConfirm.mode === "completed-bulk"
+                ? "Esta accion borrara permanentemente todas las tareas completadas."
+                : "Esta accion borrara la tarea permanentemente."}
+            </p>
+            <p className="mt-3 truncate rounded-xl bg-white/[0.04] px-3 py-2 text-sm text-white/78">
+              {deleteConfirm.text}
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setDeleteConfirm(null)}
+                className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-white/72 transition hover:bg-white/[0.08]"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  void (deleteConfirm.mode === "completed-bulk"
+                    ? deleteCompletedTasks()
+                    : deleteTask(deleteConfirm.taskId))
+                }
+                className="rounded-xl bg-[#a65463] px-3 py-2 text-sm text-white transition hover:bg-[#bb6171]"
+              >
+                Eliminar
+              </button>
+            </div>
+          </div>
         </div>
       ) : null}
     </main>
