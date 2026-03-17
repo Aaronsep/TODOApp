@@ -47,3 +47,48 @@ input {
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.12);
 }
+
+.glass {
+  position: relative;
+  overflow: hidden;
+
+  background: rgba(15, 15, 15, 0.35);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+
+  border-radius: 30px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+
+  box-shadow:
+    0 20px 60px rgba(0, 0, 0, 0.6),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+/* capa de luz superior */
+.glass::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.12),
+    rgba(255, 255, 255, 0.02) 40%,
+    transparent 100%
+  );
+
+  pointer-events: none;
+}
+
+/* capa de tint oscuro para contraste */
+.glass::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+
+  background: rgba(0, 0, 0, 0.25);
+
+  pointer-events: none;
+}

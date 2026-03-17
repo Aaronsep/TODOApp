@@ -24,7 +24,6 @@ export default function App() {
   const [draft, setDraft] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [ready, setReady] = useState(false);
-  const [panelSeed, setPanelSeed] = useState(0);
 
   useEffect(() => {
     let mounted = true;
@@ -50,13 +49,12 @@ export default function App() {
 
     const bindWindowEvents = async () => {
       const unlistenFocus = await listen("quick-focus", () => {
-        setPanelSeed((value) => value + 1);
         window.setTimeout(() => inputRef.current?.focus(), 20);
       });
 
       const unlistenClose = await appWindow.onCloseRequested(async (event) => {
         event.preventDefault();
-        await appWindow.hide();
+        await invoke("hide_current_window");
       });
 
       return () => {
@@ -78,7 +76,7 @@ export default function App() {
     const onKeyDown = async (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        await appWindow.hide();
+        await invoke("hide_current_window");
       }
     };
 
@@ -121,9 +119,8 @@ export default function App() {
     tasks.length === 1 ? "1 pendiente" : `${tasks.length} pendientes`;
 
   return (
-    <main className="h-screen w-screen overflow-hidden rounded-[30px] bg-transparent text-slate-100">
+    <main className="glass h-screen w-screen overflow-hidden rounded-[30px] bg-transparent text-slate-100">
       <section
-        key={panelSeed}
         className="flex h-full w-full animate-panel-in flex-col overflow-hidden rounded-[30px] border border-[#646b79]/55 bg-[linear-gradient(180deg,rgba(22,28,40,0.62)_0%,rgba(17,22,32,0.58)_52%,rgba(13,17,24,0.64)_100%)] shadow-note backdrop-blur-[68px]"
       >
         <div className="flex items-start justify-between gap-3 px-5 pb-3 pt-4">
@@ -134,13 +131,13 @@ export default function App() {
                 void invoke("start_window_drag");
               }
             }}
-            className="flex-1 cursor-move select-none"
+            className="flex-1 cursor-default select-none"
           >
             <p className="text-[10px] uppercase tracking-[0.36em] text-white/30">
-              Quick capture
+              Kyro capture
             </p>
             <h1 className="mt-2 text-[2rem] font-semibold tracking-[-0.04em] text-white">
-              QuickTodo
+              TODO
             </h1>
           </div>
           <button
@@ -157,9 +154,7 @@ export default function App() {
             className="mt-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-[#f5be4f] shadow-[0_0_0_1px_rgba(0,0,0,0.18)_inset]"
             aria-label="Ocultar ventana"
             title="Ocultar"
-          >
-            <span className="pointer-events-none block h-[5px] w-[5px] rounded-full bg-[#8b5b00]/50" />
-          </button>
+          />
         </div>
 
         <div className="flex min-h-0 flex-1 flex-col px-5 pb-5">
@@ -175,7 +170,7 @@ export default function App() {
                 void addTask();
               }
             }}
-            placeholder="Escribe una tarea y presiona Enter"
+            placeholder="Agrega una tarea"
             className="w-full rounded-[22px] border border-[#5f6674]/45 bg-white/[0.045] px-4 py-4 text-base text-white outline-none transition placeholder:text-white/26 focus:border-[#f5be4f]/42 focus:bg-white/[0.06] focus:ring-2 focus:ring-[#f5be4f]/10"
             autoComplete="off"
             autoCapitalize="sentences"
@@ -185,13 +180,13 @@ export default function App() {
 
         <div className="mb-3 flex items-center justify-between text-xs text-white/40">
           <span>{taskCountLabel}</span>
-          <span>Esc oculta</span>
+          
         </div>
 
         <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
           {ready && tasks.length === 0 ? (
-            <div className="rounded-[22px] border border-dashed border-[#5f6674]/38 bg-black/10 px-4 py-6 text-center text-sm text-white/38">
-              Sin pendientes. Captura la siguiente y sigue.
+            <div className="px-4 py-6 text-center text-sm text-white/38">
+              Sin pendientes.
             </div>
           ) : null}
 
