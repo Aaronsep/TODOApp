@@ -19,6 +19,10 @@ struct Task {
     id: String,
     text: String,
     created_at: String,
+    #[serde(default)]
+    completed: bool,
+    #[serde(default)]
+    important: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
