@@ -1,28 +1,33 @@
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+
+const TASK_METADATA_SCHEMA_VERSION = 1;
+
+type TaskMetadata = {
+  schemaVersion: number;
+  updatedAt: string;
+  lastCompletedAt: string | null;
+  lastReopenedAt: string | null;
+  lastImportanceChangeAt: string | null;
+  lastReorderedAt: string | null;
+};
 
 type Task = {
   id: string;
   text: string;
+  description: string;
   createdAt: string;
   completed: boolean;
   important: boolean;
+  metadata: TaskMetadata;
 };
 
-const appWindow = getCurrentWebviewWindow();
+const appWindow = getCurrentWindow();
 
 type TaskSection = "pending" | "completed";
-type ResizeDirection =
-  | "North"
-  | "South"
-  | "East"
-  | "West"
-  | "NorthEast"
-  | "NorthWest"
-  | "SouthEast"
-  | "SouthWest";
 type ContextMenuState = {
   type: "task" | "completed-section";
   taskId?: string;
@@ -35,13 +40,95 @@ type DeleteConfirmState = {
   mode: "single" | "completed-bulk";
 } | null;
 
+function createTaskMetadata(timestamp: string): TaskMetadata {
+  return {
+    schemaVersion: TASK_METADATA_SCHEMA_VERSION,
+    updatedAt: timestamp,
+    lastCompletedAt: null,
+    lastReopenedAt: null,
+    lastImportanceChangeAt: null,
+    lastReorderedAt: null,
+  };
+}
+
+function patchTaskMetadata(
+  task: Task,
+  patch: Partial<TaskMetadata>,
+  timestamp = new Date().toISOString(),
+): Task {
+  return {
+    ...task,
+    metadata: {
+      ...task.metadata,
+      schemaVersion: TASK_METADATA_SCHEMA_VERSION,
+      updatedAt: timestamp,
+      ...patch,
+    },
+  };
+}
+
+function applyCompletedState(task: Task, timestamp = new Date().toISOString()): Task {
+  return {
+    ...patchTaskMetadata(
+      task,
+      {
+        lastCompletedAt: timestamp,
+        lastImportanceChangeAt: task.important
+          ? timestamp
+          : task.metadata.lastImportanceChangeAt,
+      },
+      timestamp,
+    ),
+    completed: true,
+    important: false,
+  };
+}
+
+function applyPendingState(task: Task, timestamp = new Date().toISOString()): Task {
+  return {
+    ...patchTaskMetadata(task, { lastReopenedAt: timestamp }, timestamp),
+    completed: false,
+  };
+}
+
+function applyImportantState(
+  task: Task,
+  important: boolean,
+  timestamp = new Date().toISOString(),
+): Task {
+  return {
+    ...patchTaskMetadata(task, { lastImportanceChangeAt: timestamp }, timestamp),
+    important,
+  };
+}
+
+function applyReorderedMetadata(tasks: Task[], timestamp = new Date().toISOString()): Task[] {
+  return tasks.map((task) =>
+    patchTaskMetadata(task, { lastReorderedAt: timestamp }, timestamp),
+  );
+}
+
+function applyDescriptionState(
+  task: Task,
+  description: string,
+  timestamp = new Date().toISOString(),
+): Task {
+  return {
+    ...patchTaskMetadata(task, {}, timestamp),
+    description,
+  };
+}
+
 function createTask(text: string): Task {
+  const createdAt = new Date().toISOString();
   return {
     id: crypto.randomUUID(),
     text,
-    createdAt: new Date().toISOString(),
+    description: "",
+    createdAt,
     completed: false,
     important: false,
+    metadata: createTaskMetadata(createdAt),
   };
 }
 
@@ -52,23 +139,14 @@ function moveItem<T>(items: T[], fromIndex: number, toIndex: number): T[] {
   return nextItems;
 }
 
-const resizeHandles: Array<{
-  direction: ResizeDirection;
-  className: string;
-}> = [
-  { direction: "North", className: "absolute inset-x-4 top-0 h-2 cursor-n-resize" },
-  { direction: "South", className: "absolute inset-x-4 bottom-0 h-2 cursor-s-resize" },
-  { direction: "West", className: "absolute inset-y-4 left-0 w-2 cursor-w-resize" },
-  { direction: "East", className: "absolute inset-y-4 right-0 w-2 cursor-e-resize" },
-  { direction: "NorthWest", className: "absolute left-0 top-0 h-4 w-4 cursor-nw-resize" },
-  { direction: "NorthEast", className: "absolute right-0 top-0 h-4 w-4 cursor-ne-resize" },
-  { direction: "SouthWest", className: "absolute bottom-0 left-0 h-4 w-4 cursor-sw-resize" },
-  { direction: "SouthEast", className: "absolute bottom-0 right-0 h-4 w-4 cursor-se-resize" },
-];
-
 export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
+  const descriptionRef = useRef<HTMLTextAreaElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const focusTitleRef = useRef<HTMLButtonElement>(null);
+  const resizeUnlockTimerRef = useRef<number | null>(null);
+  const descriptionSaveTimerRef = useRef<number | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
   const [draft, setDraft] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [ready, setReady] = useState(false);
@@ -76,6 +154,10 @@ export default function App() {
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const [completedCollapsed, setCompletedCollapsed] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<DeleteConfirmState>(null);
+  const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
+  const [focusedDescription, setFocusedDescription] = useState("");
+  const [focusTitleExpanded, setFocusTitleExpanded] = useState(false);
+  const [clipboardToastVisible, setClipboardToastVisible] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -135,6 +217,11 @@ export default function App() {
           setDeleteConfirm(null);
           return;
         }
+        if (focusedTaskId) {
+          event.preventDefault();
+          await closeFocusMode();
+          return;
+        }
         event.preventDefault();
         await invoke("hide_current_window");
       }
@@ -145,7 +232,7 @@ export default function App() {
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [contextMenu, deleteConfirm]);
+  }, [contextMenu, deleteConfirm, focusedTaskId]);
 
   useEffect(() => {
     if (!contextMenu) {
@@ -168,6 +255,26 @@ export default function App() {
   }, [contextMenu]);
 
   useEffect(() => {
+    if (!focusTitleExpanded) {
+      return;
+    }
+
+    const collapseTitle = (event: MouseEvent) => {
+      if (focusTitleRef.current?.contains(event.target as Node)) {
+        return;
+      }
+
+      setFocusTitleExpanded(false);
+    };
+
+    window.addEventListener("mousedown", collapseTitle);
+
+    return () => {
+      window.removeEventListener("mousedown", collapseTitle);
+    };
+  }, [focusTitleExpanded]);
+
+  useEffect(() => {
     if (!draggingTaskId) {
       return;
     }
@@ -180,6 +287,87 @@ export default function App() {
       window.removeEventListener("mouseup", stopDragging);
     };
   }, [draggingTaskId]);
+
+  useEffect(() => {
+    if (!focusedTaskId) {
+      if (descriptionSaveTimerRef.current !== null) {
+        window.clearTimeout(descriptionSaveTimerRef.current);
+        descriptionSaveTimerRef.current = null;
+      }
+      return;
+    }
+
+    const focusedTask = tasks.find((task) => task.id === focusedTaskId);
+    if (!focusedTask) {
+      setFocusedTaskId(null);
+      setFocusedDescription("");
+      return;
+    }
+
+    if (focusedDescription === focusedTask.description) {
+      return;
+    }
+
+    if (descriptionSaveTimerRef.current !== null) {
+      window.clearTimeout(descriptionSaveTimerRef.current);
+    }
+
+    descriptionSaveTimerRef.current = window.setTimeout(() => {
+      descriptionSaveTimerRef.current = null;
+      const nextTasks = tasks.map((task) =>
+        task.id === focusedTaskId ? applyDescriptionState(task, focusedDescription) : task,
+      );
+      void persistTasks(nextTasks);
+    }, 180);
+
+    return () => {
+      if (descriptionSaveTimerRef.current !== null) {
+        window.clearTimeout(descriptionSaveTimerRef.current);
+      }
+    };
+  }, [focusedDescription, focusedTaskId, tasks]);
+
+  useEffect(() => {
+    document.title = focusedTaskId
+      ? tasks.find((task) => task.id === focusedTaskId)?.text ?? "TODO"
+      : "TODO";
+  }, [focusedTaskId, tasks]);
+
+  useEffect(() => {
+    const bindResizeEvents = async () => {
+      const unlistenResized = await appWindow.onResized(() => {
+        if (resizeUnlockTimerRef.current !== null) {
+          window.clearTimeout(resizeUnlockTimerRef.current);
+        }
+
+        resizeUnlockTimerRef.current = window.setTimeout(() => {
+          resizeUnlockTimerRef.current = null;
+          void appWindow.setResizable(false);
+        }, 140);
+      });
+
+      return () => {
+        if (resizeUnlockTimerRef.current !== null) {
+          window.clearTimeout(resizeUnlockTimerRef.current);
+        }
+        unlistenResized();
+      };
+    };
+
+    const cleanupPromise = bindResizeEvents();
+
+    return () => {
+      void cleanupPromise.then((cleanup) => cleanup());
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current !== null) {
+        window.clearTimeout(toastTimerRef.current);
+      }
+    };
+  }, []);
 
   const persistTasks = async (nextTasks: Task[]) => {
     setTasks(nextTasks);
@@ -224,6 +412,10 @@ export default function App() {
     const nextTasks = tasks.filter((task) => task.id !== taskId);
     setContextMenu(null);
     setDeleteConfirm(null);
+    if (focusedTaskId === taskId) {
+      setFocusedTaskId(null);
+      setFocusedDescription("");
+    }
     await persistTasks(nextTasks);
     window.setTimeout(() => inputRef.current?.focus(), 10);
   };
@@ -256,6 +448,10 @@ export default function App() {
   const deleteCompletedTasks = async () => {
     const nextTasks = tasks.filter((task) => !task.completed);
     setDeleteConfirm(null);
+    if (focusedTaskId && completedTasks.some((task) => task.id === focusedTaskId)) {
+      setFocusedTaskId(null);
+      setFocusedDescription("");
+    }
     await persistTasks(nextTasks);
     window.setTimeout(() => inputRef.current?.focus(), 10);
   };
@@ -269,11 +465,7 @@ export default function App() {
     const nextPendingTasks = pendingTasks.filter((task) => task.id !== taskId);
     const nextCompletedTasks = [
       ...completedTasks,
-      {
-        ...pendingTask,
-        completed: true,
-        important: false,
-      },
+      applyCompletedState(pendingTask),
     ];
 
     setContextMenu(null);
@@ -291,10 +483,7 @@ export default function App() {
     const regularTasks = pendingTasks.filter((task) => !task.important);
     const nextPendingTasks = [
       ...importantTasks,
-      {
-        ...completedTask,
-        completed: false,
-      },
+      applyPendingState(completedTask),
       ...regularTasks,
     ];
     const nextCompletedTasks = completedTasks.filter((task) => task.id !== taskId);
@@ -313,14 +502,14 @@ export default function App() {
 
     if (task.important) {
       nextPendingTasks = pendingTasks.map((item) =>
-        item.id === taskId ? { ...item, important: false } : item,
+        item.id === taskId ? applyImportantState(item, false) : item,
       );
     } else {
       const remainingTasks = pendingTasks.filter((item) => item.id !== taskId);
       const importantTasks = remainingTasks.filter((item) => item.important);
       const regularTasks = remainingTasks.filter((item) => !item.important);
       nextPendingTasks = [
-        { ...task, important: true },
+        applyImportantState(task, true),
         ...importantTasks,
         ...regularTasks,
       ];
@@ -337,11 +526,32 @@ export default function App() {
     }
 
     try {
-      await navigator.clipboard.writeText(task.text);
+      await copyTextToClipboard(task.text);
     } catch (error) {
       console.error("Failed to copy task text", error);
     } finally {
       setContextMenu(null);
+    }
+  };
+
+  const showClipboardToast = () => {
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+
+    setClipboardToastVisible(true);
+    toastTimerRef.current = window.setTimeout(() => {
+      toastTimerRef.current = null;
+      setClipboardToastVisible(false);
+    }, 1200);
+  };
+
+  const copyTextToClipboard = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      showClipboardToast();
+    } catch (error) {
+      console.error("Failed to copy text", error);
     }
   };
 
@@ -365,7 +575,7 @@ export default function App() {
       return;
     }
 
-    const reorderedSectionTasks = moveItem(sectionTasks, fromIndex, toIndex);
+    const reorderedSectionTasks = applyReorderedMetadata(moveItem(sectionTasks, fromIndex, toIndex));
     const nextTasks =
       section === "pending"
         ? rebuildTasks(reorderedSectionTasks, completedTasks)
@@ -377,9 +587,83 @@ export default function App() {
   const taskCountLabel =
     pendingTasks.length === 1 ? "1 pendiente" : `${pendingTasks.length} pendientes`;
 
+  const focusedTask = focusedTaskId
+    ? tasks.find((task) => task.id === focusedTaskId) ?? null
+    : null;
+
   const contextTask = contextMenu
     ? tasks.find((task) => task.id === contextMenu.taskId) ?? null
     : null;
+
+  const openFocusMode = (taskId: string) => {
+    const task = tasks.find((item) => item.id === taskId);
+    if (!task) {
+      return;
+    }
+
+    setContextMenu(null);
+    setDeleteConfirm(null);
+    setDraggingTaskId(null);
+    setFocusedTaskId(taskId);
+    setFocusedDescription(task.description);
+    setFocusTitleExpanded(false);
+    window.setTimeout(() => {
+      const textarea = descriptionRef.current;
+      if (!textarea) {
+        return;
+      }
+
+      textarea.focus();
+      const end = textarea.value.length;
+      textarea.setSelectionRange(end, end);
+    }, 30);
+  };
+
+  const flushFocusedDescription = async (taskId: string | null, description: string) => {
+    if (!taskId) {
+      return;
+    }
+
+    const task = tasks.find((item) => item.id === taskId);
+    if (!task || task.description === description) {
+      return;
+    }
+
+    if (descriptionSaveTimerRef.current !== null) {
+      window.clearTimeout(descriptionSaveTimerRef.current);
+      descriptionSaveTimerRef.current = null;
+    }
+
+    await persistTasks(
+      tasks.map((item) =>
+        item.id === taskId ? applyDescriptionState(item, description) : item,
+      ),
+    );
+  };
+
+  const closeFocusMode = async () => {
+    await flushFocusedDescription(focusedTaskId, focusedDescription);
+    setFocusedTaskId(null);
+    setFocusedDescription("");
+    setFocusTitleExpanded(false);
+    window.setTimeout(() => inputRef.current?.focus(), 20);
+  };
+
+  const startCornerResize = async (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (event.button !== 0) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (resizeUnlockTimerRef.current !== null) {
+      window.clearTimeout(resizeUnlockTimerRef.current);
+      resizeUnlockTimerRef.current = null;
+    }
+
+    await invoke("start_window_resize_corner");
+  };
 
   const getContextMenuPosition = (menuType: "task" | "completed-section") => {
     const estimatedHeight =
@@ -404,8 +688,7 @@ export default function App() {
     const importantTasks = pendingTasks.filter((task) => task.important);
     const regularTasks = pendingTasks.filter((task) => !task.important);
     const restoredTasks = completedTasks.map((task) => ({
-      ...task,
-      completed: false,
+      ...applyPendingState(task),
     }));
 
     setContextMenu(null);
@@ -435,6 +718,9 @@ export default function App() {
               y: event.clientY,
             });
           }}
+          onDoubleClick={() => {
+            openFocusMode(task.id);
+          }}
           onMouseEnter={() => {
             if (!draggingTaskId || draggingTaskId === task.id) {
               return;
@@ -443,12 +729,12 @@ export default function App() {
           }}
           className={`group flex w-full animate-item-in items-center gap-3 rounded-[22px] border px-3 py-3 text-left transition ${
             draggingTaskId === task.id
-              ? "border-[#8b94a5]/75 bg-white/[0.06]"
+              ? "border-white/70 bg-white/[0.06]"
               : task.important && !task.completed
-                ? "border-[#bb6a74]/82 bg-[linear-gradient(180deg,rgba(173,72,88,0.18),rgba(108,34,46,0.13))] shadow-[inset_0_1px_0_rgba(255,196,204,0.05)] hover:border-[#ca7883]/88 hover:bg-[linear-gradient(180deg,rgba(186,82,99,0.22),rgba(121,39,52,0.16))]"
+                ? "border-[rgba(123,88,96,0.48)] bg-[linear-gradient(180deg,rgba(173,72,88,0.18),rgba(108,34,46,0.13))] shadow-[inset_0_1px_0_rgba(255,196,204,0.05)] hover:border-[rgba(226,230,238,0.78)] hover:bg-[linear-gradient(180deg,rgba(186,82,99,0.22),rgba(121,39,52,0.16))]"
                 : task.completed
-                  ? "border-[#5f6671]/52 bg-[linear-gradient(180deg,rgba(112,120,132,0.12),rgba(83,90,101,0.09))] hover:border-[#717987]/58 hover:bg-[linear-gradient(180deg,rgba(122,130,143,0.14),rgba(88,96,108,0.11))]"
-                  : "border-[#667080]/48 bg-white/[0.03] hover:border-[#7d8695]/55 hover:bg-white/[0.05]"
+                  ? "border-[rgba(100,109,122,0.42)] bg-[linear-gradient(180deg,rgba(112,120,132,0.12),rgba(83,90,101,0.09))] hover:border-[rgba(226,230,238,0.62)] hover:bg-[linear-gradient(180deg,rgba(122,130,143,0.14),rgba(88,96,108,0.11))]"
+                  : "border-[rgba(104,113,126,0.44)] bg-white/[0.03] hover:border-[rgba(230,234,241,0.72)] hover:bg-white/[0.05]"
           } select-none`}
         >
           <button
@@ -490,20 +776,12 @@ export default function App() {
 
   return (
     <main className="glass h-screen w-screen overflow-hidden rounded-[30px] bg-transparent text-slate-100">
-      {resizeHandles.map((handle) => (
-        <div
-          key={handle.direction}
-          className={handle.className}
-          onMouseDown={(event) => {
-            if (event.button !== 0) {
-              return;
-            }
-            event.preventDefault();
-            event.stopPropagation();
-            void appWindow.startResizeDragging(handle.direction);
-          }}
-        />
-      ))}
+      <div
+        className="absolute bottom-0 right-0 z-20 h-5 w-5 cursor-se-resize"
+        onMouseDown={(event) => {
+          void startCornerResize(event);
+        }}
+      />
       <section
         className="flex h-full w-full animate-panel-in flex-col overflow-hidden rounded-[30px] border border-[#646b79]/55 bg-[linear-gradient(180deg,rgba(22,28,40,0.62)_0%,rgba(17,22,32,0.58)_52%,rgba(13,17,24,0.64)_100%)] shadow-note backdrop-blur-[68px]"
       >
@@ -520,9 +798,11 @@ export default function App() {
             <p className="text-[10px] uppercase tracking-[0.36em] text-white/30">
               Kyro capture
             </p>
-            <h1 className="mt-2 text-[2rem] font-semibold tracking-[-0.04em] text-white">
-              TODO
-            </h1>
+            {!focusedTask ? (
+              <h1 className="mt-2 text-[2rem] font-semibold tracking-[-0.04em] text-white">
+                TODO
+              </h1>
+            ) : null}
           </div>
           <button
             type="button"
@@ -541,67 +821,281 @@ export default function App() {
           />
         </div>
 
-        <div className="flex min-h-0 flex-1 flex-col px-5 pb-5">
-          <label className="mb-4 block">
-            <span className="sr-only">Nueva tarea</span>
-            <input
-              ref={inputRef}
-              value={draft}
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
+        {focusedTask ? (
+          <div className="flex min-h-0 flex-1 flex-col px-5 pb-5">
+            <div className="flex items-start gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  void closeFocusMode();
+                }}
+                className="flex h-9 w-9 items-center justify-center text-white/72 transition hover:text-white"
+                aria-label="Volver"
+                title="Volver"
+              >
+                <svg
+                  aria-hidden="true"
+                  viewBox="0 0 24 24"
+                  className="h-5 w-5"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M15 18l-6-6 6-6" />
+                </svg>
+              </button>
+              <button
+                ref={focusTitleRef}
+                type="button"
+                onClick={() => setFocusTitleExpanded((value) => !value)}
+                onContextMenu={(event) => {
                   event.preventDefault();
-                  void addTask();
-                }
-              }}
-              placeholder="Agrega una tarea"
-              className="w-full rounded-[22px] border border-[#5f6674]/45 bg-white/[0.045] px-4 py-4 text-base text-white outline-none transition placeholder:text-white/26 focus:border-[#f5be4f]/42 focus:bg-white/[0.06] focus:ring-2 focus:ring-[#f5be4f]/10"
-              autoComplete="off"
-              autoCapitalize="sentences"
-              autoCorrect="on"
-            />
-          </label>
-
-          <div className="mb-3 flex items-center justify-between text-xs text-white/40">
-            <span>{taskCountLabel}</span>
-          </div>
-
-          <div className="scroll-area min-h-0 flex-1 space-y-5 overflow-y-auto pr-2">
-            <div className="space-y-2">
-              {ready && pendingTasks.length === 0 ? (
-                <div className="px-4 py-6 text-center text-sm text-white/38">
-                  Sin pendientes.
-                </div>
-              ) : null}
-              {renderTaskList("pending", pendingTasks)}
+                  void copyTextToClipboard(focusedTask.text);
+                }}
+                className={`max-w-[320px] pt-0.5 text-left text-[2.05rem] font-semibold leading-tight tracking-[-0.05em] text-white ${
+                  focusTitleExpanded ? "" : "truncate"
+                }`}
+                title={focusTitleExpanded ? undefined : focusedTask.text}
+              >
+                {focusedTask.text}
+              </button>
             </div>
 
-            {completedTasks.length > 0 ? (
-              <div className="space-y-2 border-t border-white/6 pt-4">
+            <div className="mt-5 flex items-center justify-between gap-4 text-sm text-white/54">
+              <div className="flex items-center gap-4">
+                <span
+                  className={`inline-flex items-center gap-2 rounded-full px-4 py-2 ${
+                    focusedTask.completed
+                      ? "bg-white/[0.08] text-white/48"
+                      : focusedTask.important
+                        ? "bg-[rgba(164,74,88,0.22)] text-[#f0b5be]"
+                        : "bg-[rgba(58,77,128,0.36)] text-white/76"
+                  }`}
+                >
+                  <span
+                    className={`h-2.5 w-2.5 rounded-full ${
+                      focusedTask.completed
+                        ? "bg-[#79c88b]"
+                        : focusedTask.important
+                          ? "bg-[#e08d98]"
+                          : "bg-[#f2bf5d]"
+                    }`}
+                  />
+                  {focusedTask.completed
+                    ? "Completada"
+                    : focusedTask.important
+                      ? "Prioritaria"
+                      : "Pendiente"}
+                </span>
+                <span className="text-white/56">
+                  {new Date(focusedTask.createdAt).toLocaleDateString("es-MX", {
+                    day: "numeric",
+                    month: "short",
+                    year: "numeric",
+                  })}
+                </span>
+              </div>
+              <div className="flex items-center gap-1">
+                {!focusedTask.completed ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void toggleTaskImportant(focusedTask.id);
+                    }}
+                    className={`flex h-9 w-9 items-center justify-center rounded-full transition hover:bg-white/[0.05] ${
+                      focusedTask.important
+                        ? "text-[#e08d98]"
+                        : "text-white/58 hover:text-white"
+                    }`}
+                    aria-label={focusedTask.important ? "Quitar prioridad" : "Marcar prioritaria"}
+                    title={focusedTask.important ? "Quitar prioridad" : "Marcar prioritaria"}
+                  >
+                    <svg
+                      aria-hidden="true"
+                      viewBox="0 0 24 24"
+                      className="h-5 w-5"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.3"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M12 5v9" />
+                      <path d="M12 18.5v.5" />
+                    </svg>
+                  </button>
+                ) : null}
                 <button
                   type="button"
-                  onClick={() => setCompletedCollapsed((value) => !value)}
-                  onContextMenu={(event) => {
-                    event.preventDefault();
-                    setContextMenu({
-                      type: "completed-section",
-                      x: event.clientX,
-                      y: event.clientY,
-                    });
+                  onClick={() => {
+                    if (focusedTask.completed) {
+                      void markTaskAsPending(focusedTask.id);
+                    } else {
+                      void markTaskAsCompleted(focusedTask.id);
+                    }
                   }}
-                  className="flex items-center gap-2 rounded-xl bg-white/[0.07] px-3 py-2 text-sm text-white/82 transition hover:bg-white/[0.1]"
+                  className="flex h-9 w-9 items-center justify-center rounded-full text-white/58 transition hover:bg-white/[0.05] hover:text-white"
+                  aria-label={focusedTask.completed ? "Marcar incompleta" : "Marcar completada"}
+                  title={focusedTask.completed ? "Marcar incompleta" : "Marcar completada"}
                 >
-                  <span className="text-[12px] text-white/70">
-                    {completedCollapsed ? "›" : "⌄"}
-                  </span>
-                  <span>Completed</span>
-                  <span className="text-white/48">{completedTasks.length}</span>
+                  {focusedTask.completed ? (
+                    <svg
+                      aria-hidden="true"
+                      viewBox="0 0 24 24"
+                      className="h-5 w-5"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                      <path d="M21 3v6h-6" />
+                    </svg>
+                  ) : (
+                    <svg
+                      aria-hidden="true"
+                      viewBox="0 0 24 24"
+                      className="h-5 w-5"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M6 12.5l3.2 3.2L16 9" />
+                      <path d="M11 12.5l3.2 3.2L21 9" />
+                    </svg>
+                  )}
                 </button>
-                {!completedCollapsed ? renderTaskList("completed", completedTasks) : null}
               </div>
-            ) : null}
+            </div>
+
+            <div className="mt-5 h-px shrink-0 bg-white/[0.07]" />
+
+            <div className="mt-5 flex min-h-0 flex-1 flex-col">
+              <div className="mb-4 text-[11px] uppercase tracking-[0.34em] text-white/34">
+                Descripción
+              </div>
+              <label className="flex min-h-0 flex-1 flex-col">
+                <textarea
+                  ref={descriptionRef}
+                  value={focusedDescription}
+                  onChange={(event) => setFocusedDescription(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter") {
+                      return;
+                    }
+
+                    if (event.shiftKey) {
+                      return;
+                    }
+
+                    event.preventDefault();
+                    void closeFocusMode();
+                  }}
+                  placeholder="Agrega una descripción"
+                  className="min-h-0 flex-1 resize-none appearance-none rounded-[26px] border border-[#5f6674]/16 bg-[rgba(18,24,36,0.58)] px-5 py-5 text-sm leading-7 text-white/82 outline-none transition placeholder:text-white/24 hover:border-white/62 focus:border-[#f5be4f]/34 focus:bg-[rgba(22,28,40,0.62)] [color-scheme:dark] caret-white"
+                  style={{ WebkitTextFillColor: "rgba(255,255,255,0.82)" }}
+                />
+              </label>
+            </div>
+
+            <div className="mt-5 h-px shrink-0 bg-white/[0.07]" />
+
+            <div className="flex items-center justify-between pt-5">
+              <button
+                type="button"
+                onClick={() => requestDeleteTask(focusedTask.id)}
+                className="flex items-center gap-3 text-[1.05rem] text-[#d99ba5] transition hover:text-[#e7aab4]"
+              >
+                <svg
+                  aria-hidden="true"
+                  viewBox="0 0 24 24"
+                  className="h-5 w-5"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.9"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M3 6h18" />
+                  <path d="M8 6V4.8c0-.7.56-1.3 1.25-1.3h5.5c.69 0 1.25.6 1.25 1.3V6" />
+                  <path d="M6.5 6l.9 12.1c.05.8.72 1.4 1.52 1.4h6.16c.8 0 1.47-.6 1.52-1.4L17.5 6" />
+                  <path d="M10 10.5v5.5" />
+                  <path d="M14 10.5v5.5" />
+                </svg>
+                <span>Eliminar tarea</span>
+              </button>
+            </div>
           </div>
-        </div>
+        ) : (
+          <>
+            <div className="flex min-h-0 flex-1 flex-col px-5 pb-5">
+              <label className="mb-4 block">
+                <span className="sr-only">Nueva tarea</span>
+                <input
+                  ref={inputRef}
+                  value={draft}
+                  onChange={(event) => setDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void addTask();
+                    }
+                  }}
+                  placeholder="Agrega una tarea"
+                  className="w-full rounded-[22px] border border-[#5f6674]/16 bg-white/[0.045] px-4 py-4 text-base text-white outline-none transition placeholder:text-white/26 hover:border-white/68 focus:border-[#f5be4f]/42 focus:bg-white/[0.06] focus:ring-2 focus:ring-[#f5be4f]/10"
+                  autoComplete="off"
+                  autoCapitalize="sentences"
+                  autoCorrect="on"
+                />
+              </label>
+
+              <div className="mb-3 flex items-center justify-between text-xs text-white/40">
+                <span>{taskCountLabel}</span>
+              </div>
+
+              <div className="scroll-area min-h-0 flex-1 space-y-5 overflow-y-auto pr-2">
+                <div className="space-y-2">
+                  {ready && pendingTasks.length === 0 ? (
+                    <div className="px-4 py-6 text-center text-sm text-white/38">
+                      Sin pendientes.
+                    </div>
+                  ) : null}
+                  {renderTaskList("pending", pendingTasks)}
+                </div>
+
+                {completedTasks.length > 0 ? (
+                  <div className="space-y-2 border-t border-white/6 pt-4">
+                    <button
+                      type="button"
+                      onClick={() => setCompletedCollapsed((value) => !value)}
+                      onContextMenu={(event) => {
+                        event.preventDefault();
+                        setContextMenu({
+                          type: "completed-section",
+                          x: event.clientX,
+                          y: event.clientY,
+                        });
+                      }}
+                      className="flex items-center gap-2 rounded-xl bg-white/[0.07] px-3 py-2 text-sm text-white/82 transition hover:bg-white/[0.1]"
+                    >
+                      <span className="text-[12px] text-white/70">
+                        {completedCollapsed ? "›" : "⌄"}
+                      </span>
+                      <span>Completed</span>
+                      <span className="text-white/48">{completedTasks.length}</span>
+                    </button>
+                    {!completedCollapsed ? renderTaskList("completed", completedTasks) : null}
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </>
+        )}
       </section>
       {contextMenu && contextMenu.type === "task" && contextTask ? (
         <div
@@ -712,6 +1206,24 @@ export default function App() {
               </button>
             </div>
           </div>
+        </div>
+      ) : null}
+      {clipboardToastVisible ? (
+        <div className="pointer-events-none fixed bottom-5 left-1/2 z-[70] flex -translate-x-1/2 items-center gap-2 rounded-full border border-white/10 bg-[rgba(18,22,30,0.92)] px-3 py-1.5 text-xs text-white/82 shadow-[0_16px_40px_rgba(0,0,0,0.32)] backdrop-blur-[18px]">
+          <svg
+            aria-hidden="true"
+            viewBox="0 0 24 24"
+            className="h-3.5 w-3.5"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <rect x="9" y="9" width="10" height="10" rx="2" />
+            <path d="M7 15H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2v1" />
+          </svg>
+          <span>Copiado al portapapeles</span>
         </div>
       ) : null}
     </main>

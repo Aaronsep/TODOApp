@@ -6,23 +6,88 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, Window, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_runtime::ResizeDirection;
 
 const PRIMARY_SHORTCUT_LABEL: &str = "Ctrl+M";
 const FALLBACK_SHORTCUT_LABEL: &str = "Alt+Space";
+const TASK_METADATA_SCHEMA_VERSION: u8 = 1;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct TaskMetadata {
+    #[serde(default = "default_task_metadata_schema_version")]
+    schema_version: u8,
+    #[serde(default)]
+    updated_at: String,
+    #[serde(default)]
+    last_completed_at: Option<String>,
+    #[serde(default)]
+    last_reopened_at: Option<String>,
+    #[serde(default)]
+    last_importance_change_at: Option<String>,
+    #[serde(default)]
+    last_reordered_at: Option<String>,
+}
+
+impl Default for TaskMetadata {
+    fn default() -> Self {
+        Self {
+            schema_version: TASK_METADATA_SCHEMA_VERSION,
+            updated_at: String::new(),
+            last_completed_at: None,
+            last_reopened_at: None,
+            last_importance_change_at: None,
+            last_reordered_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct Task {
     id: String,
     text: String,
+    #[serde(default)]
+    description: String,
     created_at: String,
     #[serde(default)]
     completed: bool,
     #[serde(default)]
     important: bool,
+    #[serde(default)]
+    metadata: TaskMetadata,
+}
+
+impl Task {
+    fn ensure_metadata(mut self) -> Self {
+        self.metadata.schema_version = TASK_METADATA_SCHEMA_VERSION;
+
+        if self.metadata.updated_at.is_empty() {
+            self.metadata.updated_at = self.created_at.clone();
+        }
+
+        if self.completed && self.metadata.last_completed_at.is_none() {
+            self.metadata.last_completed_at = Some(self.created_at.clone());
+        }
+
+        if self.important && self.metadata.last_importance_change_at.is_none() {
+            self.metadata.last_importance_change_at = Some(self.created_at.clone());
+        }
+
+        self
+    }
+}
+
+fn default_task_metadata_schema_version() -> u8 {
+    TASK_METADATA_SCHEMA_VERSION
+}
+
+fn write_tasks(path: &PathBuf, tasks: &[Task]) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(tasks).map_err(|error| error.to_string())?;
+    fs::write(path, content).map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,7 +154,7 @@ fn restore_window_position(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    let content = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
     let position: StoredWindowPosition =
         serde_json::from_str(&content).map_err(|error| error.to_string())?;
 
@@ -196,15 +261,26 @@ fn load_tasks(app: AppHandle) -> Result<Vec<Task>, String> {
         return Ok(Vec::new());
     }
 
-    let content = fs::read_to_string(path).map_err(|error| error.to_string())?;
-    serde_json::from_str(&content).map_err(|error| error.to_string())
+    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let stored_tasks: Vec<Task> = serde_json::from_str(&content).map_err(|error| error.to_string())?;
+    let tasks: Vec<Task> = stored_tasks
+        .clone()
+        .into_iter()
+        .map(Task::ensure_metadata)
+        .collect();
+
+    if tasks != stored_tasks {
+        write_tasks(&path, &tasks)?;
+    }
+
+    Ok(tasks)
 }
 
 #[tauri::command]
 fn save_tasks(app: AppHandle, tasks: Vec<Task>) -> Result<(), String> {
     let path = tasks_path(&app)?;
-    let content = serde_json::to_string_pretty(&tasks).map_err(|error| error.to_string())?;
-    fs::write(path, content).map_err(|error| error.to_string())
+    let tasks: Vec<Task> = tasks.into_iter().map(Task::ensure_metadata).collect();
+    write_tasks(&path, &tasks)
 }
 
 #[tauri::command]
@@ -224,6 +300,16 @@ fn hide_current_window(window: tauri::WebviewWindow) -> Result<(), String> {
 #[tauri::command]
 fn start_window_drag(window: tauri::WebviewWindow) -> Result<(), String> {
     window.start_dragging().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn start_window_resize_corner(window: Window) -> Result<(), String> {
+    window
+        .set_resizable(true)
+        .map_err(|error| error.to_string())?;
+    window
+        .start_resize_dragging(ResizeDirection::SouthEast)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -279,7 +365,8 @@ pub fn run() {
             save_tasks,
             active_shortcut,
             hide_current_window,
-            start_window_drag
+            start_window_drag,
+            start_window_resize_corner
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

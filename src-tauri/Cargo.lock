@@ -87,6 +87,7 @@ dependencies = [
  "tauri-plugin-autostart",
  "tauri-plugin-global-shortcut",
  "tauri-plugin-log",
+ "tauri-runtime",
 ]
 
 [[package]]

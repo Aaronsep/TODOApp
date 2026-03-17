@@ -24,6 +24,7 @@ body,
 
 body {
   background: transparent;
+  isolation: isolate;
 }
 
 button,
@@ -70,8 +71,13 @@ input {
 .glass {
   position: relative;
   overflow: hidden;
+  isolation: isolate;
+  contain: paint;
+  will-change: transform, backdrop-filter;
+  transform: translate3d(0, 0, 0);
+  backface-visibility: hidden;
 
-  background: rgba(15, 15, 15, 0.20);
+  background: rgba(15, 15, 15, 0.25);
   backdrop-filter: blur(28px);
   -webkit-backdrop-filter: blur(28px);
 
@@ -83,13 +89,38 @@ input {
     inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 
-/* capa de luz superior */
+/* capa visual viva dentro del glass */
 .glass::before {
   content: "";
   position: absolute;
-  inset: 0;
+  inset: -40px; /* más espacio para que se note el movimiento */
   border-radius: inherit;
   pointer-events: none;
+
+  background:
+    radial-gradient(
+      circle at 20% 20%,
+      rgba(80, 120, 255, 0.25),
+      transparent 40%
+    ),
+    radial-gradient(
+      circle at 80% 30%,
+      rgba(120, 80, 255, 0.18),
+      transparent 50%
+    ),
+    radial-gradient(
+      circle at 50% 80%,
+      rgba(0, 200, 255, 0.12),
+      transparent 60%
+    );
+
+  /* 🔥 cambios clave */
+  filter: blur(14px); /* antes 18px */
+  opacity: 1; /* antes 0.95 */
+  mix-blend-mode: normal; /* antes overlay */
+
+  animation: glassFlow 18s ease-in-out infinite alternate;
+  will-change: transform;
 }
 
 /* capa de tint oscuro para contraste */
@@ -98,8 +129,19 @@ input {
   position: absolute;
   inset: 0;
   border-radius: inherit;
-
-  background: rgba(0, 0, 0, 0.15);
-
   pointer-events: none;
+  transform: translateZ(0);
+
+  background: rgba(0, 0, 0, 0.20);
+}
+@keyframes glassFlow {
+  0% {
+    transform: translate3d(0px, 0px, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(-20px, -12px, 0) scale(1.04);
+  }
+  100% {
+    transform: translate3d(16px, 18px, 0) scale(1.06);
+  }
 }
