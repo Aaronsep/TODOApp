@@ -14,6 +14,15 @@ type Task = {
 const appWindow = getCurrentWebviewWindow();
 
 type TaskSection = "pending" | "completed";
+type ResizeDirection =
+  | "North"
+  | "South"
+  | "East"
+  | "West"
+  | "NorthEast"
+  | "NorthWest"
+  | "SouthEast"
+  | "SouthWest";
 type ContextMenuState = {
   type: "task" | "completed-section";
   taskId?: string;
@@ -42,6 +51,20 @@ function moveItem<T>(items: T[], fromIndex: number, toIndex: number): T[] {
   nextItems.splice(toIndex, 0, movedItem);
   return nextItems;
 }
+
+const resizeHandles: Array<{
+  direction: ResizeDirection;
+  className: string;
+}> = [
+  { direction: "North", className: "absolute inset-x-4 top-0 h-2 cursor-n-resize" },
+  { direction: "South", className: "absolute inset-x-4 bottom-0 h-2 cursor-s-resize" },
+  { direction: "West", className: "absolute inset-y-4 left-0 w-2 cursor-w-resize" },
+  { direction: "East", className: "absolute inset-y-4 right-0 w-2 cursor-e-resize" },
+  { direction: "NorthWest", className: "absolute left-0 top-0 h-4 w-4 cursor-nw-resize" },
+  { direction: "NorthEast", className: "absolute right-0 top-0 h-4 w-4 cursor-ne-resize" },
+  { direction: "SouthWest", className: "absolute bottom-0 left-0 h-4 w-4 cursor-sw-resize" },
+  { direction: "SouthEast", className: "absolute bottom-0 right-0 h-4 w-4 cursor-se-resize" },
+];
 
 export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -276,6 +299,7 @@ export default function App() {
     ];
     const nextCompletedTasks = completedTasks.filter((task) => task.id !== taskId);
 
+    setContextMenu(null);
     await persistTasks(rebuildTasks(nextPendingTasks, nextCompletedTasks));
   };
 
@@ -356,6 +380,21 @@ export default function App() {
   const contextTask = contextMenu
     ? tasks.find((task) => task.id === contextMenu.taskId) ?? null
     : null;
+
+  const getContextMenuPosition = (menuType: "task" | "completed-section") => {
+    const estimatedHeight =
+      menuType === "completed-section"
+        ? 104
+        : contextTask?.completed
+          ? 118
+          : 156;
+    const estimatedWidth = menuType === "completed-section" ? 236 : 196;
+
+    return {
+      left: Math.max(12, Math.min((contextMenu?.x ?? 12), window.innerWidth - estimatedWidth - 12)),
+      top: Math.max(12, Math.min((contextMenu?.y ?? 12), window.innerHeight - estimatedHeight - 12)),
+    };
+  };
 
   const markAllCompletedAsPending = async () => {
     if (completedTasks.length === 0) {
@@ -451,6 +490,20 @@ export default function App() {
 
   return (
     <main className="glass h-screen w-screen overflow-hidden rounded-[30px] bg-transparent text-slate-100">
+      {resizeHandles.map((handle) => (
+        <div
+          key={handle.direction}
+          className={handle.className}
+          onMouseDown={(event) => {
+            if (event.button !== 0) {
+              return;
+            }
+            event.preventDefault();
+            event.stopPropagation();
+            void appWindow.startResizeDragging(handle.direction);
+          }}
+        />
+      ))}
       <section
         className="flex h-full w-full animate-panel-in flex-col overflow-hidden rounded-[30px] border border-[#646b79]/55 bg-[linear-gradient(180deg,rgba(22,28,40,0.62)_0%,rgba(17,22,32,0.58)_52%,rgba(13,17,24,0.64)_100%)] shadow-note backdrop-blur-[68px]"
       >
@@ -554,10 +607,7 @@ export default function App() {
         <div
           ref={menuRef}
           className="fixed z-50 min-w-[180px] overflow-hidden rounded-2xl border border-[#667080]/55 bg-[rgba(18,22,30,0.94)] p-1.5 shadow-[0_20px_45px_rgba(0,0,0,0.45)] backdrop-blur-[24px]"
-          style={{
-            left: Math.min(contextMenu.x, window.innerWidth - 196),
-            top: Math.min(contextMenu.y, window.innerHeight - (contextTask.completed ? 68 : 108)),
-          }}
+          style={getContextMenuPosition("task")}
         >
           <button
             type="button"
@@ -608,10 +658,7 @@ export default function App() {
         <div
           ref={menuRef}
           className="fixed z-50 min-w-[220px] overflow-hidden rounded-2xl border border-[#667080]/55 bg-[rgba(18,22,30,0.94)] p-1.5 shadow-[0_20px_45px_rgba(0,0,0,0.45)] backdrop-blur-[24px]"
-          style={{
-            left: Math.min(contextMenu.x, window.innerWidth - 236),
-            top: Math.min(contextMenu.y, window.innerHeight - 132),
-          }}
+          style={getContextMenuPosition("completed-section")}
         >
           <button
             type="button"
