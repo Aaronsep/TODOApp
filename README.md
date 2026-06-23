@@ -1,19 +1,28 @@
 # QuickTodo
 
-Aplicacion de escritorio para Windows hecha con Tauri + React + TypeScript + Tailwind.
+Aplicacion de escritorio (tipo sticky note) hecha con Tauri 2 + React + TypeScript + Tailwind.
 
-La idea es simple: una TODO app tipo sticky note que vive en segundo plano, se abre con un hotkey global, permite capturar tareas en segundos y elimina permanentemente una tarea al marcarla como completada.
+La idea es simple: una TODO app que vive en segundo plano, se abre con un hotkey global, permite capturar tareas en segundos y mantenerlas organizadas, con un look translucido nativo (Liquid Glass en macOS 26).
 
 ## Que hace
 
-- Corre como app de escritorio ligera.
-- Vive en background con icono en system tray.
-- Abre una ventana compacta con hotkey global.
-- Enfoca el input automaticamente al mostrarse.
-- `Enter` agrega una tarea nueva.
-- Click en una tarea = completada y borrada para siempre.
-- Guarda solo tareas pendientes en almacenamiento local.
-- `Esc` oculta la ventana.
+- Corre como app de escritorio ligera, viva en background con icono en la barra de menu / system tray.
+- Se abre/oculta con un **hotkey global** (por defecto `Ctrl + Espacio`, configurable).
+- Se enfoca el input automaticamente y `Enter` agrega una tarea.
+- `Ctrl/Cmd + Enter` agrega la tarea como **importante**.
+- Click en el circulo = completar (la tarea pasa a la seccion **Completed**, recuperable).
+- **Tareas importantes**: suben al inicio y se marca su checkbox en rojo.
+- **Reordenar** arrastrando dentro de cada seccion.
+- **Focus mode** (doble click en una tarea): titulo editable, estado, fecha y descripcion con autoguardado.
+- **Editar titulo**: doble click sobre el titulo en focus mode, o clic derecho > "Editar tarea".
+- **Menu de clic derecho nativo** (NSMenu real en macOS): editar, copiar, importante, completar, eliminar.
+- **Deshacer** al eliminar (toast de 5s).
+- **Navegacion por teclado**: `↑/↓` selecciona, `Enter`/`Espacio` completa, `⌘/Ctrl + Backspace` elimina, `i` marca importante.
+- **Ocultar al perder foco** (tipo Spotlight), con animacion suave de aparicion/desaparicion.
+- **Redimensionar** la ventana desde cualquier borde o esquina.
+- **Preferencias** (boton de engrane): hotkey configurable, iniciar con el sistema, ocultar al perder foco, exportar/importar.
+- **Exportar / Importar** tareas en JSON, y exportar a Markdown.
+- `Esc` oculta la ventana (o cierra el panel/edicion segun el contexto).
 
 ## Stack
 
@@ -22,78 +31,33 @@ La idea es simple: una TODO app tipo sticky note que vive en segundo plano, se a
 - TypeScript
 - Tailwind CSS
 - Rust para la logica nativa
-
-## Flujo de uso
-
-1. La app arranca y queda viva en segundo plano.
-2. Presionas `Ctrl + M`.
-3. Aparece una ventana pequena, centrada y enfocada.
-4. Escribes una tarea.
-5. Presionas `Enter`.
-6. La tarea se guarda y queda visible en la lista.
-7. Cuando haces click sobre una tarea, se elimina definitivamente.
-8. `Esc` oculta la ventana.
-9. Puedes volver a abrirla con el hotkey o desde el tray.
+- [`tauri-plugin-liquid-glass`](https://github.com/hkandala/tauri-plugin-liquid-glass) para el material Liquid Glass nativo en macOS 26+
 
 ## Hotkey global
 
-Por defecto intenta registrar:
+Por defecto registra `Ctrl + Espacio`. Si esta ocupado, cae a `Alt/Option + Espacio`.
 
-- `Ctrl + M`
+Desde **Preferencias** puedes elegir entre varios presets: `Ctrl+Space`, `Option+Space`, `Cmd+Shift+Space`, `Ctrl+M`. El atajo activo se aplica al instante y se recuerda.
 
-Si Windows o alguna otra app ya lo esta usando, hace fallback automatico a:
+## Apariencia (Liquid Glass)
 
-- `Alt + Space`
-
-El atajo activo se muestra en la esquina superior derecha de la UI.
-
-La logica esta en [src-tauri/src/lib.rs](/C:/Users/winte/Desktop/Programacion/TODOApp/src-tauri/src/lib.rs).
+En **macOS 26 (Tahoe)** la ventana usa `NSGlassEffectView` nativo (Liquid Glass real) por detras de un webview transparente. En sistemas anteriores cae automaticamente a vibrancy clasico (`NSVisualEffectView`). El radio, el tinte y la variante se configuran desde el frontend (`setLiquidGlassEffect`).
 
 ## Persistencia
 
-No se usa base de datos pesada.
+Las tareas se guardan en un archivo JSON dentro del directorio de datos de la app.
 
-Las tareas pendientes se guardan en un archivo JSON dentro del directorio de datos de la aplicacion de Tauri. La ruta exacta depende del sistema, pero en Windows vive dentro del `AppData` del usuario bajo el identificador de la app.
+- **Escritura atomica** (archivo temporal + rename): un corte a mitad de guardado nunca deja el JSON a medias.
+- **Respaldo** `tasks.bak` antes de cada guardado.
+- Si `tasks.json` se corrompe, intenta recuperar desde `tasks.bak` y guarda el dañado en `tasks.corrupt.json` para no perder datos.
 
-Cada tarea tiene:
-
-- `id`
-- `text`
-- `createdAt`
-
-No hay historial de completadas, papelera ni categorias.
-
-## Estructura del proyecto
-
-```text
-TODOApp/
-  src/
-    App.tsx              # UI principal, captura, lista, foco, eventos
-    main.tsx             # bootstrap React
-    styles.css           # Tailwind + estilos globales
-  src-tauri/
-    src/
-      lib.rs             # hotkey global, tray, persistencia, comandos
-      main.rs            # entrada nativa
-    capabilities/
-      desktop.json       # permisos Tauri desktop
-    tauri.conf.json      # ventana, build, bundle
-  package.json
-  vite.config.ts
-  tailwind.config.ts
-```
+Las preferencias se guardan en `settings.json`.
 
 ## Requisitos para desarrollo
 
-Necesitas tener instalado:
-
-- Node.js
-- npm
-- Rust
-- Visual Studio Build Tools para compilar en Windows
-- WebView2 Runtime de Microsoft
-
-Si ya pudiste correr `cargo` y `npm`, normalmente ya tienes lo principal.
+- Node.js + npm
+- Rust (rustup) + toolchain estable
+- macOS: Xcode Command Line Tools (`xcode-select --install`). No necesita WebView2 (eso es solo Windows).
 
 ## Instalacion local
 
@@ -103,188 +67,61 @@ npm install
 
 ## Desarrollo
 
-Para desarrollo normal usa:
-
 ```bash
 npm run tauri:dev
 ```
 
-Eso hace dos cosas:
+Levanta Vite en `http://localhost:1420` y abre la app Tauri conectada al frontend en modo dev. Cambios en el frontend recargan al instante; cambios en Rust (`src-tauri/src/lib.rs`) recompilan la parte nativa.
 
-- levanta Vite en `http://localhost:1420`
-- abre la app Tauri conectada al frontend en modo dev
-
-### Como ir viendo cambios
-
-Si cambias frontend:
-
-- archivos en [src/App.tsx](/C:/Users/winte/Desktop/Programacion/TODOApp/src/App.tsx)
-- archivos en [src/styles.css](/C:/Users/winte/Desktop/Programacion/TODOApp/src/styles.css)
-
-Vite recarga casi al instante.
-
-Si cambias backend Rust:
-
-- archivo en [src-tauri/src/lib.rs](/C:/Users/winte/Desktop/Programacion/TODOApp/src-tauri/src/lib.rs)
-
-Tauri recompila la parte nativa. Ese ciclo es mas lento que el del frontend, pero sigue siendo razonable.
-
-### Comandos utiles durante desarrollo
-
-Levantar solo el frontend:
+Comandos utiles:
 
 ```bash
-npm run dev
+npm run dev            # solo frontend
+npm run build          # build web (tsc + vite)
+cd src-tauri && cargo check   # chequeo del backend Rust
 ```
 
-Build web solamente:
-
-```bash
-npm run build
-```
-
-Chequeo del backend Rust:
-
-```bash
-cd src-tauri
-cargo check
-```
-
-## Build para Windows
-
-Para generar el ejecutable e instaladores:
+## Build
 
 ```bash
 npm run tauri:build
 ```
 
-Esto compila:
+En macOS genera la app y el instalador en:
 
-- frontend de produccion
-- binario nativo de Tauri
-- instaladores para Windows
+- `src-tauri/target/release/bundle/macos/TODO.app`
+- `src-tauri/target/release/bundle/dmg/TODO_<version>_aarch64.dmg`
 
-Los artefactos salen en:
+Para Macs Intel: `rustup target add x86_64-apple-darwin` y `npm run tauri:build -- --target x86_64-apple-darwin`.
 
-- [src-tauri/target/release/app.exe](/C:/Users/winte/Desktop/Programacion/TODOApp/src-tauri/target/release/app.exe)
-- [src-tauri/target/release/bundle/nsis](/C:/Users/winte/Desktop/Programacion/TODOApp/src-tauri/target/release/bundle/nsis)
-- [src-tauri/target/release/bundle/msi](/C:/Users/winte/Desktop/Programacion/TODOApp/src-tauri/target/release/bundle/msi)
+> La app no esta firmada/notarizada. La primera vez macOS puede bloquearla: usa "Abrir de todos modos" en Ajustes del Sistema > Privacidad y Seguridad, o `xattr -dr com.apple.quarantine /ruta/a/TODO.app`.
 
-En este proyecto ya se validaron ambos:
+## Estructura del proyecto
 
-- instalador `.exe` con NSIS
-- instalador `.msi`
+```text
+TODOApp/
+  src/
+    App.tsx              # UI principal: captura, lista, focus mode, teclado, preferencias
+    main.tsx             # bootstrap React
+    styles.css           # Tailwind + estilos del glass
+  src-tauri/
+    src/
+      lib.rs             # hotkey, tray, persistencia, menu nativo, settings, resize, comandos
+      main.rs            # entrada nativa
+    capabilities/        # permisos Tauri
+    tauri.conf.json      # ventana, build, bundle
+  package.json
+  vite.config.ts
+  tailwind.config.ts
+```
 
-## Como funciona internamente
+## Archivos clave
 
-### Frontend
-
-El frontend hace tres cosas principales:
-
-1. Carga tareas persistidas al iniciar.
-2. Guarda tareas nuevas al crear.
-3. Elimina del estado y del almacenamiento cuando completas una tarea.
-
-Tambien escucha un evento nativo para volver a enfocar el input cuando la ventana aparece por hotkey o tray.
-
-### Backend Tauri
-
-La parte Rust hace lo siguiente:
-
-- registra el hotkey global
-- crea el tray icon
-- muestra/oculta la ventana principal
-- expone comandos a React para cargar y guardar tareas
-- guarda el JSON en disco
-
-## Archivos clave para tocar segun lo que quieras cambiar
-
-### Cambiar UI o experiencia visual
-
-- [src/App.tsx](/C:/Users/winte/Desktop/Programacion/TODOApp/src/App.tsx)
-- [src/styles.css](/C:/Users/winte/Desktop/Programacion/TODOApp/src/styles.css)
-- [tailwind.config.ts](/C:/Users/winte/Desktop/Programacion/TODOApp/tailwind.config.ts)
-
-### Cambiar comportamiento de ventana
-
-- [src-tauri/tauri.conf.json](/C:/Users/winte/Desktop/Programacion/TODOApp/src-tauri/tauri.conf.json)
-
-Aqui puedes ajustar:
-
-- tamano
-- transparencia
-- decoraciones
-- always on top
-- posicion inicial
-- si aparece en taskbar o no
-
-### Cambiar hotkey, tray o persistencia
-
-- [src-tauri/src/lib.rs](/C:/Users/winte/Desktop/Programacion/TODOApp/src-tauri/src/lib.rs)
-
-Busca especialmente:
-
-- `PRIMARY_SHORTCUT_LABEL`
-- `FALLBACK_SHORTCUT_LABEL`
-- `register_shortcut`
-- `toggle_main_window`
-- `load_tasks`
-- `save_tasks`
-
-## Notas de comportamiento
-
-- Completar una tarea la borra definitivamente.
-- Cerrar la ventana no mata el proceso; la oculta para mantener el flujo rapido.
-- El tray tiene acciones para mostrar/ocultar y salir.
-- La ventana no esta pensada como dashboard, sino como quick capture.
-
-## Problemas comunes
-
-### El hotkey no responde
-
-Posibles causas:
-
-- otra app ya esta usando `Ctrl + M`
-- Windows capturo ese atajo
-- la app cayo a `Alt + Space`
-
-Revisa el indicador del atajo en la UI para ver cual quedo activo.
-
-### La app compila pero no abre bien
-
-Verifica:
-
-- que `npm run tauri:dev` este levantando Vite en `1420`
-- que Rust este instalado correctamente
-- que WebView2 este presente en Windows
-
-### Quiero cambiar el tamano de la ventana
-
-Edita [src-tauri/tauri.conf.json](/C:/Users/winte/Desktop/Programacion/TODOApp/src-tauri/tauri.conf.json) y modifica:
-
-- `width`
-- `height`
-- `minWidth`
-- `minHeight`
-
-## Decisiones tecnicas
-
-- Tauri en lugar de Electron para mantener bajo consumo y binario mas ligero.
-- JSON local para persistencia por simplicidad y robustez.
-- Tray + hotkey global para priorizar acceso inmediato.
-- UI minima, sin paneles extra ni navegacion innecesaria.
-
-## Siguiente iteracion natural
-
-Si quieres seguir desarrollandola, las mejoras mas razonables sin romper la simplicidad serian:
-
-- hacer configurable el hotkey desde archivo o UI minima
-- soportar click fuera para ocultar ventana
-- animacion nativa mas refinada al mostrar/ocultar
-- autoarranque con Windows
+- UI / experiencia: `src/App.tsx`, `src/styles.css`, `tailwind.config.ts`
+- Ventana / bundle: `src-tauri/tauri.conf.json`
+- Hotkey, tray, persistencia, menu nativo, settings, resize: `src-tauri/src/lib.rs`
 
 ## Filosofia del proyecto
 
-No sobre-ingenierices la solucion.
-Esta app debe seguir siendo una utilidad rapida, pequena y enfocada.
-Cada cambio deberia favorecer ligereza, rapidez de uso y simplicidad.
+Una utilidad rapida, pequeña y enfocada. Cada cambio deberia favorecer ligereza, rapidez de uso y simplicidad.
+```

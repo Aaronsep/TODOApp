@@ -3,6 +3,26 @@ import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { save, open } from "@tauri-apps/plugin-dialog";
+import {
+  isGlassSupported,
+  setLiquidGlassEffect,
+  GlassMaterialVariant,
+} from "tauri-plugin-liquid-glass-api";
+
+type AppSettings = {
+  hideOnBlur: boolean;
+  autostart: boolean;
+  shortcut: string;
+};
+
+const SHORTCUT_PRESETS = ["Ctrl+Space", "Alt+Space", "Cmd+Shift+Space", "Ctrl+M"];
+
+const DEFAULT_SETTINGS: AppSettings = {
+  hideOnBlur: true,
+  autostart: true,
+  shortcut: "Ctrl+Space",
+};
 
 const TASK_METADATA_SCHEMA_VERSION = 1;
 
@@ -28,12 +48,6 @@ type Task = {
 const appWindow = getCurrentWindow();
 
 type TaskSection = "pending" | "completed";
-type ContextMenuState = {
-  type: "task" | "completed-section";
-  taskId?: string;
-  x: number;
-  y: number;
-} | null;
 type DeleteConfirmState = {
   taskId: string;
   text: string;
@@ -119,6 +133,17 @@ function applyDescriptionState(
   };
 }
 
+function applyTitleState(
+  task: Task,
+  text: string,
+  timestamp = new Date().toISOString(),
+): Task {
+  return {
+    ...patchTaskMetadata(task, {}, timestamp),
+    text,
+  };
+}
+
 function createTask(text: string): Task {
   const createdAt = new Date().toISOString();
   return {
@@ -142,22 +167,61 @@ function moveItem<T>(items: T[], fromIndex: number, toIndex: number): T[] {
 export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
   const descriptionRef = useRef<HTMLTextAreaElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
+  const titleInputRef = useRef<HTMLInputElement>(null);
   const focusTitleRef = useRef<HTMLButtonElement>(null);
   const resizeUnlockTimerRef = useRef<number | null>(null);
   const descriptionSaveTimerRef = useRef<number | null>(null);
   const toastTimerRef = useRef<number | null>(null);
+  const skipTitleSaveRef = useRef(false);
+  const menuActionRef = useRef<(action: string, taskId: string | null) => void>(
+    () => {},
+  );
   const [draft, setDraft] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [ready, setReady] = useState(false);
   const [draggingTaskId, setDraggingTaskId] = useState<string | null>(null);
-  const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const [completedCollapsed, setCompletedCollapsed] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<DeleteConfirmState>(null);
   const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
   const [focusedDescription, setFocusedDescription] = useState("");
   const [focusTitleExpanded, setFocusTitleExpanded] = useState(false);
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
   const [clipboardToastVisible, setClipboardToastVisible] = useState(false);
+  const [undoVisible, setUndoVisible] = useState(false);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [visible, setVisible] = useState(true);
+  const undoSnapshotRef = useRef<Task[] | null>(null);
+  const undoTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    // Liquid Glass nativo (NSGlassEffectView) en macOS 26+. No-op en otros sistemas.
+    void (async () => {
+      try {
+        if (await isGlassSupported()) {
+          await setLiquidGlassEffect({
+            cornerRadius: 30,
+            variant: GlassMaterialVariant.Regular,
+          });
+        }
+      } catch (error) {
+        console.error("Failed to apply liquid glass", error);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const stored = await invoke<AppSettings>("load_settings");
+        setSettings(stored);
+      } catch (error) {
+        console.error("Failed to load settings", error);
+      }
+    })();
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -209,8 +273,12 @@ export default function App() {
   useEffect(() => {
     const onKeyDown = async (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        if (contextMenu) {
-          setContextMenu(null);
+        if (settingsOpen) {
+          setSettingsOpen(false);
+          return;
+        }
+        if (editingTitle) {
+          cancelTitle();
           return;
         }
         if (deleteConfirm) {
@@ -220,6 +288,12 @@ export default function App() {
         if (focusedTaskId) {
           event.preventDefault();
           await closeFocusMode();
+          return;
+        }
+        if (selectedTaskId && document.activeElement !== inputRef.current) {
+          event.preventDefault();
+          setSelectedTaskId(null);
+          inputRef.current?.focus();
           return;
         }
         event.preventDefault();
@@ -232,27 +306,32 @@ export default function App() {
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [contextMenu, deleteConfirm, focusedTaskId]);
+  }, [settingsOpen, editingTitle, deleteConfirm, focusedTaskId, selectedTaskId]);
 
+  // Enruta las acciones del menu contextual nativo a las funciones existentes.
+  // Se registra una sola vez; usa una ref para no capturar estado viejo.
   useEffect(() => {
-    if (!contextMenu) {
-      return;
-    }
-
-    const closeMenu = (event: MouseEvent) => {
-      if (menuRef.current?.contains(event.target as Node)) {
-        return;
-      }
-      setContextMenu(null);
-    };
-
-    window.addEventListener("mousedown", closeMenu);
-    window.addEventListener("blur", () => setContextMenu(null), { once: true });
+    const unlistenPromise = listen<{ action: string; taskId: string | null }>(
+      "task-menu-action",
+      (event) => {
+        menuActionRef.current(event.payload.action, event.payload.taskId);
+      },
+    );
 
     return () => {
-      window.removeEventListener("mousedown", closeMenu);
+      void unlistenPromise.then((unlisten) => unlisten());
     };
-  }, [contextMenu]);
+  }, []);
+
+  // Animacion de aparicion/desaparicion de la ventana.
+  useEffect(() => {
+    const showPromise = listen("quick-focus", () => setVisible(true));
+    const hidePromise = listen("animate-hide", () => setVisible(false));
+    return () => {
+      void showPromise.then((unlisten) => unlisten());
+      void hidePromise.then((unlisten) => unlisten());
+    };
+  }, []);
 
   useEffect(() => {
     if (!focusTitleExpanded) {
@@ -366,6 +445,9 @@ export default function App() {
       if (toastTimerRef.current !== null) {
         window.clearTimeout(toastTimerRef.current);
       }
+      if (undoTimerRef.current !== null) {
+        window.clearTimeout(undoTimerRef.current);
+      }
     };
   }, []);
 
@@ -379,16 +461,19 @@ export default function App() {
     }
   };
 
-  const addTask = async () => {
+  const addTask = async (important = false) => {
     const text = draft.trim();
     if (!text) {
       return;
     }
 
-    const newTask = createTask(text);
+    const base = createTask(text);
+    const newTask = important ? applyImportantState(base, true) : base;
     const importantTasks = pendingTasks.filter((task) => task.important);
     const regularTasks = pendingTasks.filter((task) => !task.important);
-    const nextPendingTasks = [...importantTasks, newTask, ...regularTasks];
+    const nextPendingTasks = important
+      ? [newTask, ...importantTasks, ...regularTasks]
+      : [...importantTasks, newTask, ...regularTasks];
     const nextTasks = rebuildTasks(nextPendingTasks, completedTasks);
     setDraft("");
     await persistTasks(nextTasks);
@@ -408,15 +493,107 @@ export default function App() {
     return [...sortPendingTasks(nextPendingTasks), ...nextCompletedTasks];
   };
 
+  const showUndo = (snapshot: Task[]) => {
+    undoSnapshotRef.current = snapshot;
+    if (undoTimerRef.current !== null) {
+      window.clearTimeout(undoTimerRef.current);
+    }
+    setUndoVisible(true);
+    undoTimerRef.current = window.setTimeout(() => {
+      undoTimerRef.current = null;
+      undoSnapshotRef.current = null;
+      setUndoVisible(false);
+    }, 5000);
+  };
+
+  const undoDelete = async () => {
+    const snapshot = undoSnapshotRef.current;
+    if (undoTimerRef.current !== null) {
+      window.clearTimeout(undoTimerRef.current);
+      undoTimerRef.current = null;
+    }
+    undoSnapshotRef.current = null;
+    setUndoVisible(false);
+    if (snapshot) {
+      await persistTasks(snapshot);
+    }
+  };
+
+  const toggleHideOnBlur = async (enabled: boolean) => {
+    setSettings((prev) => ({ ...prev, hideOnBlur: enabled }));
+    try {
+      await invoke("set_hide_on_blur", { enabled });
+    } catch (error) {
+      console.error("Failed to set hide_on_blur", error);
+    }
+  };
+
+  const toggleAutostart = async (enabled: boolean) => {
+    setSettings((prev) => ({ ...prev, autostart: enabled }));
+    try {
+      await invoke("set_autostart", { enabled });
+    } catch (error) {
+      console.error("Failed to set autostart", error);
+    }
+  };
+
+  const changeShortcut = async (label: string) => {
+    try {
+      const active = await invoke<string>("set_shortcut", { label });
+      setSettings((prev) => ({ ...prev, shortcut: active }));
+    } catch (error) {
+      console.error("Failed to set shortcut", error);
+    }
+  };
+
+  const exportTasks = async (format: "json" | "markdown") => {
+    try {
+      await invoke("suppress_autohide", { ms: 120000 });
+      const ext = format === "markdown" ? "md" : "json";
+      const path = await save({
+        defaultPath: `todos.${ext}`,
+        filters: [
+          { name: format === "markdown" ? "Markdown" : "JSON", extensions: [ext] },
+        ],
+      });
+      if (path) {
+        await invoke("export_tasks", { path, format });
+      }
+    } catch (error) {
+      console.error("Failed to export tasks", error);
+    }
+  };
+
+  const importTasks = async () => {
+    try {
+      await invoke("suppress_autohide", { ms: 120000 });
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (typeof selected === "string") {
+        const imported = await invoke<Task[]>("import_tasks", { path: selected });
+        setTasks(imported);
+        setSettingsOpen(false);
+      }
+    } catch (error) {
+      console.error("Failed to import tasks", error);
+    }
+  };
+
   const deleteTask = async (taskId: string) => {
+    const snapshot = tasks;
     const nextTasks = tasks.filter((task) => task.id !== taskId);
-    setContextMenu(null);
     setDeleteConfirm(null);
+    if (selectedTaskId === taskId) {
+      setSelectedTaskId(null);
+    }
     if (focusedTaskId === taskId) {
       setFocusedTaskId(null);
       setFocusedDescription("");
     }
     await persistTasks(nextTasks);
+    showUndo(snapshot);
     window.setTimeout(() => inputRef.current?.focus(), 10);
   };
 
@@ -425,7 +602,6 @@ export default function App() {
     if (!task) {
       return;
     }
-    setContextMenu(null);
     setDeleteConfirm({
       taskId,
       text: task.text,
@@ -437,7 +613,6 @@ export default function App() {
     if (completedTasks.length === 0) {
       return;
     }
-    setContextMenu(null);
     setDeleteConfirm({
       taskId: "__completed_bulk__",
       text: `${completedTasks.length} tareas completadas`,
@@ -446,6 +621,7 @@ export default function App() {
   };
 
   const deleteCompletedTasks = async () => {
+    const snapshot = tasks;
     const nextTasks = tasks.filter((task) => !task.completed);
     setDeleteConfirm(null);
     if (focusedTaskId && completedTasks.some((task) => task.id === focusedTaskId)) {
@@ -453,6 +629,7 @@ export default function App() {
       setFocusedDescription("");
     }
     await persistTasks(nextTasks);
+    showUndo(snapshot);
     window.setTimeout(() => inputRef.current?.focus(), 10);
   };
 
@@ -468,7 +645,6 @@ export default function App() {
       applyCompletedState(pendingTask),
     ];
 
-    setContextMenu(null);
     await persistTasks(rebuildTasks(nextPendingTasks, nextCompletedTasks));
     window.setTimeout(() => inputRef.current?.focus(), 10);
   };
@@ -488,7 +664,6 @@ export default function App() {
     ];
     const nextCompletedTasks = completedTasks.filter((task) => task.id !== taskId);
 
-    setContextMenu(null);
     await persistTasks(rebuildTasks(nextPendingTasks, nextCompletedTasks));
   };
 
@@ -515,7 +690,6 @@ export default function App() {
       ];
     }
 
-    setContextMenu(null);
     await persistTasks(rebuildTasks(nextPendingTasks, completedTasks));
   };
 
@@ -529,8 +703,6 @@ export default function App() {
       await copyTextToClipboard(task.text);
     } catch (error) {
       console.error("Failed to copy task text", error);
-    } finally {
-      setContextMenu(null);
     }
   };
 
@@ -591,22 +763,18 @@ export default function App() {
     ? tasks.find((task) => task.id === focusedTaskId) ?? null
     : null;
 
-  const contextTask = contextMenu
-    ? tasks.find((task) => task.id === contextMenu.taskId) ?? null
-    : null;
-
   const openFocusMode = (taskId: string) => {
     const task = tasks.find((item) => item.id === taskId);
     if (!task) {
       return;
     }
 
-    setContextMenu(null);
     setDeleteConfirm(null);
     setDraggingTaskId(null);
     setFocusedTaskId(taskId);
     setFocusedDescription(task.description);
     setFocusTitleExpanded(false);
+    setEditingTitle(false);
     window.setTimeout(() => {
       const textarea = descriptionRef.current;
       if (!textarea) {
@@ -641,7 +809,23 @@ export default function App() {
     );
   };
 
+  const flushTitle = async (taskId: string, text: string) => {
+    const trimmed = text.trim();
+    const task = tasks.find((item) => item.id === taskId);
+    if (!task || !trimmed || trimmed === task.text) {
+      return;
+    }
+
+    await persistTasks(
+      tasks.map((item) => (item.id === taskId ? applyTitleState(item, trimmed) : item)),
+    );
+  };
+
   const closeFocusMode = async () => {
+    if (editingTitle && focusedTaskId) {
+      await flushTitle(focusedTaskId, titleDraft);
+    }
+    setEditingTitle(false);
     await flushFocusedDescription(focusedTaskId, focusedDescription);
     setFocusedTaskId(null);
     setFocusedDescription("");
@@ -649,7 +833,64 @@ export default function App() {
     window.setTimeout(() => inputRef.current?.focus(), 20);
   };
 
-  const startCornerResize = async (event: ReactMouseEvent<HTMLDivElement>) => {
+  const editTaskTitle = (taskId: string) => {
+    const task = tasks.find((item) => item.id === taskId);
+    if (!task) {
+      return;
+    }
+    setDeleteConfirm(null);
+    setDraggingTaskId(null);
+    setFocusedTaskId(taskId);
+    setFocusedDescription(task.description);
+    setFocusTitleExpanded(false);
+    setTitleDraft(task.text);
+    setEditingTitle(true);
+    window.setTimeout(() => {
+      titleInputRef.current?.focus();
+      titleInputRef.current?.select();
+    }, 40);
+  };
+
+  const startEditingTitle = () => {
+    if (!focusedTask) {
+      return;
+    }
+    setTitleDraft(focusedTask.text);
+    setEditingTitle(true);
+    window.setTimeout(() => {
+      const input = titleInputRef.current;
+      if (!input) {
+        return;
+      }
+      input.focus();
+      input.select();
+    }, 20);
+  };
+
+  const commitTitle = async () => {
+    if (focusedTaskId) {
+      await flushTitle(focusedTaskId, titleDraft);
+    }
+    setEditingTitle(false);
+  };
+
+  const cancelTitle = () => {
+    skipTitleSaveRef.current = true;
+    setEditingTitle(false);
+  };
+
+  const handleTitleBlur = () => {
+    if (skipTitleSaveRef.current) {
+      skipTitleSaveRef.current = false;
+      return;
+    }
+    void commitTitle();
+  };
+
+  const startResize = async (
+    event: ReactMouseEvent<HTMLDivElement>,
+    direction: string,
+  ) => {
     if (event.button !== 0) {
       return;
     }
@@ -662,22 +903,7 @@ export default function App() {
       resizeUnlockTimerRef.current = null;
     }
 
-    await invoke("start_window_resize_corner");
-  };
-
-  const getContextMenuPosition = (menuType: "task" | "completed-section") => {
-    const estimatedHeight =
-      menuType === "completed-section"
-        ? 104
-        : contextTask?.completed
-          ? 118
-          : 156;
-    const estimatedWidth = menuType === "completed-section" ? 236 : 196;
-
-    return {
-      left: Math.max(12, Math.min((contextMenu?.x ?? 12), window.innerWidth - estimatedWidth - 12)),
-      top: Math.max(12, Math.min((contextMenu?.y ?? 12), window.innerHeight - estimatedHeight - 12)),
-    };
+    await invoke("start_window_resize", { direction });
   };
 
   const markAllCompletedAsPending = async () => {
@@ -691,9 +917,122 @@ export default function App() {
       ...applyPendingState(task),
     }));
 
-    setContextMenu(null);
     await persistTasks([...importantTasks, ...restoredTasks, ...regularTasks]);
   };
+
+  // Despacha la accion elegida en el menu contextual nativo. Se reasigna cada render
+  // para que el listener (registrado una sola vez) siempre vea el estado actual.
+  menuActionRef.current = (action, taskId) => {
+    switch (action) {
+      case "edit":
+        if (taskId) editTaskTitle(taskId);
+        break;
+      case "copy":
+        if (taskId) void copyTaskText(taskId);
+        break;
+      case "important":
+        if (taskId) void toggleTaskImportant(taskId);
+        break;
+      case "toggle": {
+        if (!taskId) break;
+        const task = tasks.find((item) => item.id === taskId);
+        if (!task) break;
+        if (task.completed) {
+          void markTaskAsPending(taskId);
+        } else {
+          void markTaskAsCompleted(taskId);
+        }
+        break;
+      }
+      case "delete":
+        if (taskId) requestDeleteTask(taskId);
+        break;
+      case "section-restore-all":
+        void markAllCompletedAsPending();
+        break;
+      case "section-delete-completed":
+        requestDeleteCompletedTasks();
+        break;
+      default:
+        break;
+    }
+  };
+
+  const moveSelection = (delta: number) => {
+    const list = pendingTasks;
+    if (list.length === 0) {
+      return;
+    }
+    const currentIndex = list.findIndex((task) => task.id === selectedTaskId);
+    const nextIndex =
+      currentIndex === -1
+        ? delta > 0
+          ? 0
+          : list.length - 1
+        : Math.min(list.length - 1, Math.max(0, currentIndex + delta));
+    setSelectedTaskId(list[nextIndex].id);
+  };
+
+  // Navegacion por teclado de la lista (cuando no se esta escribiendo en un campo).
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (focusedTaskId || deleteConfirm || editingTitle) {
+        return;
+      }
+
+      const active = document.activeElement;
+      const inField =
+        active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement;
+
+      if (inField) {
+        // Desde el input de captura, ArrowDown salta a la lista.
+        if (event.key === "ArrowDown" && pendingTasks.length > 0) {
+          event.preventDefault();
+          inputRef.current?.blur();
+          setSelectedTaskId((prev) => prev ?? pendingTasks[0].id);
+        }
+        return;
+      }
+
+      switch (event.key) {
+        case "ArrowDown":
+          event.preventDefault();
+          moveSelection(1);
+          break;
+        case "ArrowUp":
+          event.preventDefault();
+          moveSelection(-1);
+          break;
+        case "Enter":
+        case " ":
+          if (selectedTaskId) {
+            event.preventDefault();
+            void markTaskAsCompleted(selectedTaskId);
+            setSelectedTaskId(null);
+          }
+          break;
+        case "Backspace":
+        case "Delete":
+          if (selectedTaskId && (event.metaKey || event.ctrlKey)) {
+            event.preventDefault();
+            requestDeleteTask(selectedTaskId);
+          }
+          break;
+        case "i":
+        case "I":
+          if (selectedTaskId) {
+            event.preventDefault();
+            void toggleTaskImportant(selectedTaskId);
+          }
+          break;
+        default:
+          break;
+      }
+    };
+
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [pendingTasks, selectedTaskId, focusedTaskId, deleteConfirm, editingTitle]);
 
   const renderTaskList = (section: TaskSection, sectionTasks: Task[]) => (
     <div className="space-y-2">
@@ -707,15 +1046,15 @@ export default function App() {
             if (event.target instanceof HTMLElement && event.target.closest("button")) {
               return;
             }
+            setSelectedTaskId(task.id);
             setDraggingTaskId(task.id);
           }}
           onContextMenu={(event) => {
             event.preventDefault();
-            setContextMenu({
-              type: "task",
+            void invoke("show_task_context_menu", {
               taskId: task.id,
-              x: event.clientX,
-              y: event.clientY,
+              isCompleted: task.completed,
+              isImportant: task.important,
             });
           }}
           onDoubleClick={() => {
@@ -735,6 +1074,10 @@ export default function App() {
                 : task.completed
                   ? "border-[rgba(100,109,122,0.42)] bg-[linear-gradient(180deg,rgba(112,120,132,0.12),rgba(83,90,101,0.09))] hover:border-[rgba(226,230,238,0.62)] hover:bg-[linear-gradient(180deg,rgba(122,130,143,0.14),rgba(88,96,108,0.11))]"
                   : "border-[rgba(104,113,126,0.44)] bg-white/[0.03] hover:border-[rgba(230,234,241,0.72)] hover:bg-white/[0.05]"
+          } ${
+            selectedTaskId === task.id
+              ? "ring-1 ring-inset ring-white/50 bg-white/[0.07]"
+              : ""
           } select-none`}
         >
           <button
@@ -749,7 +1092,9 @@ export default function App() {
             className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border text-[10px] transition ${
               task.completed
                 ? "border-transparent bg-[#8f98a6] text-[12px] font-black text-[#20262e]"
-                : "border-[#6b7382]/45 bg-black/20 text-transparent hover:border-[#f5be4f]/55 hover:bg-[#f5be4f]/12 hover:text-[#f5be4f]"
+                : task.important
+                  ? "border-[#e26b7a] bg-[#e26b7a]/12 text-transparent ring-2 ring-[#e26b7a]/35 hover:bg-[#e26b7a]/22 hover:text-[#e26b7a]"
+                  : "border-[#6b7382]/45 bg-black/20 text-transparent hover:border-[#f5be4f]/55 hover:bg-[#f5be4f]/12 hover:text-[#f5be4f]"
             }`}
             aria-label={task.completed ? "Regresar tarea a pendientes" : "Completar tarea"}
           >
@@ -762,28 +1107,52 @@ export default function App() {
           >
             {task.text}
           </span>
-          {task.important && !task.completed ? (
-            <span
-              className="h-2.5 w-2.5 shrink-0 rounded-full bg-[#df808d] shadow-[0_0_0_5px_rgba(223,128,141,0.18)]"
-              aria-label="Tarea prioritaria"
-              title="Tarea prioritaria"
-            />
-          ) : null}
         </div>
       ))}
     </div>
   );
 
   return (
-    <main className="glass h-screen w-screen overflow-hidden rounded-[30px] bg-transparent text-slate-100">
+    <main
+      className={`glass h-screen w-screen origin-center transform-gpu overflow-hidden rounded-[30px] bg-transparent text-neutral-100 transition-[opacity,transform] duration-150 ease-out ${
+        visible ? "scale-100 opacity-100" : "scale-[0.97] opacity-0"
+      }`}
+    >
+      {/* Tiradores de resize: 4 bordes + 4 esquinas. Las esquinas van por encima. */}
       <div
-        className="absolute bottom-0 right-0 z-20 h-5 w-5 cursor-se-resize"
-        onMouseDown={(event) => {
-          void startCornerResize(event);
-        }}
+        className="absolute left-2 right-2 top-0 z-20 h-1.5 cursor-n-resize"
+        onMouseDown={(event) => void startResize(event, "north")}
+      />
+      <div
+        className="absolute bottom-0 left-2 right-2 z-20 h-1.5 cursor-s-resize"
+        onMouseDown={(event) => void startResize(event, "south")}
+      />
+      <div
+        className="absolute bottom-2 left-0 top-2 z-20 w-1.5 cursor-w-resize"
+        onMouseDown={(event) => void startResize(event, "west")}
+      />
+      <div
+        className="absolute bottom-2 right-0 top-2 z-20 w-1.5 cursor-e-resize"
+        onMouseDown={(event) => void startResize(event, "east")}
+      />
+      <div
+        className="absolute left-0 top-0 z-30 h-3 w-3 cursor-nw-resize"
+        onMouseDown={(event) => void startResize(event, "north-west")}
+      />
+      <div
+        className="absolute right-0 top-0 z-30 h-3 w-3 cursor-ne-resize"
+        onMouseDown={(event) => void startResize(event, "north-east")}
+      />
+      <div
+        className="absolute bottom-0 left-0 z-30 h-3 w-3 cursor-sw-resize"
+        onMouseDown={(event) => void startResize(event, "south-west")}
+      />
+      <div
+        className="absolute bottom-0 right-0 z-30 h-3 w-3 cursor-se-resize"
+        onMouseDown={(event) => void startResize(event, "south-east")}
       />
       <section
-        className="flex h-full w-full animate-panel-in flex-col overflow-hidden rounded-[30px] border border-[#646b79]/55 bg-[linear-gradient(180deg,rgba(22,28,40,0.62)_0%,rgba(17,22,32,0.58)_52%,rgba(13,17,24,0.64)_100%)] shadow-note backdrop-blur-[68px]"
+        className="flex h-full w-full animate-panel-in flex-col overflow-hidden rounded-[30px] border border-white/[0.06] bg-transparent"
       >
         <div className="flex items-start justify-between gap-3 px-5 pb-3 pt-4">
           <div
@@ -804,21 +1173,52 @@ export default function App() {
               </h1>
             ) : null}
           </div>
-          <button
-            type="button"
-            onMouseDown={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-            }}
-            onClick={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              void invoke("hide_current_window");
-            }}
-            className="mt-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-[#f5be4f] shadow-[0_0_0_1px_rgba(0,0,0,0.18)_inset]"
-            aria-label="Ocultar ventana"
-            title="Ocultar"
-          />
+          <div className="mt-1 flex items-center gap-2.5">
+            <button
+              type="button"
+              onMouseDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setSettingsOpen(true);
+              }}
+              className="flex h-4 w-4 items-center justify-center text-white/40 transition hover:text-white/80"
+              aria-label="Preferencias"
+              title="Preferencias"
+            >
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+                className="h-4 w-4"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              onMouseDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                void invoke("hide_current_window");
+              }}
+              className="flex h-3.5 w-3.5 items-center justify-center rounded-full bg-[#f5be4f] shadow-[0_0_0_1px_rgba(0,0,0,0.18)_inset]"
+              aria-label="Ocultar ventana"
+              title="Ocultar"
+            />
+          </div>
         </div>
 
         {focusedTask ? (
@@ -846,21 +1246,45 @@ export default function App() {
                   <path d="M15 18l-6-6 6-6" />
                 </svg>
               </button>
-              <button
-                ref={focusTitleRef}
-                type="button"
-                onClick={() => setFocusTitleExpanded((value) => !value)}
-                onContextMenu={(event) => {
-                  event.preventDefault();
-                  void copyTextToClipboard(focusedTask.text);
-                }}
-                className={`max-w-[320px] pt-0.5 text-left text-[2.05rem] font-semibold leading-tight tracking-[-0.05em] text-white ${
-                  focusTitleExpanded ? "" : "truncate"
-                }`}
-                title={focusTitleExpanded ? undefined : focusedTask.text}
-              >
-                {focusedTask.text}
-              </button>
+              {editingTitle ? (
+                <input
+                  ref={titleInputRef}
+                  value={titleDraft}
+                  onChange={(event) => setTitleDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void commitTitle();
+                    } else if (event.key === "Escape") {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      cancelTitle();
+                    }
+                  }}
+                  onBlur={handleTitleBlur}
+                  className="w-full max-w-[320px] rounded-[14px] border border-[#f5be4f]/40 bg-white/[0.06] px-3 py-1 text-[1.5rem] font-semibold leading-snug tracking-[-0.03em] text-white caret-white outline-none"
+                  autoComplete="off"
+                />
+              ) : (
+                <button
+                  ref={focusTitleRef}
+                  type="button"
+                  onClick={() => setFocusTitleExpanded((value) => !value)}
+                  onDoubleClick={() => startEditingTitle()}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    void copyTextToClipboard(focusedTask.text);
+                  }}
+                  className={`max-w-[320px] pt-0.5 text-left text-[1.5rem] font-semibold leading-snug tracking-[-0.03em] text-white break-words ${
+                    focusTitleExpanded
+                      ? "scroll-area max-h-[34vh] overflow-y-auto"
+                      : "truncate"
+                  }`}
+                  title={focusTitleExpanded ? undefined : focusedTask.text}
+                >
+                  {focusedTask.text}
+                </button>
+              )}
             </div>
 
             <div className="mt-5 flex items-center justify-between gap-4 text-sm text-white/54">
@@ -871,7 +1295,7 @@ export default function App() {
                       ? "bg-white/[0.08] text-white/48"
                       : focusedTask.important
                         ? "bg-[rgba(164,74,88,0.22)] text-[#f0b5be]"
-                        : "bg-[rgba(58,77,128,0.36)] text-white/76"
+                        : "bg-white/[0.08] text-white/76"
                   }`}
                 >
                   <span
@@ -997,7 +1421,7 @@ export default function App() {
                     void closeFocusMode();
                   }}
                   placeholder="Agrega una descripción"
-                  className="min-h-0 flex-1 resize-none appearance-none rounded-[26px] border border-[#5f6674]/16 bg-[rgba(18,24,36,0.58)] px-5 py-5 text-sm leading-7 text-white/82 outline-none transition placeholder:text-white/24 hover:border-white/62 focus:border-[#f5be4f]/34 focus:bg-[rgba(22,28,40,0.62)] [color-scheme:dark] caret-white"
+                  className="min-h-0 flex-1 resize-none appearance-none rounded-[26px] border border-white/[0.10] bg-white/[0.05] px-5 py-5 text-sm leading-7 text-white/82 outline-none transition placeholder:text-white/24 hover:border-white/62 focus:border-[#f5be4f]/34 focus:bg-white/[0.07] [color-scheme:dark] caret-white"
                   style={{ WebkitTextFillColor: "rgba(255,255,255,0.82)" }}
                 />
               </label>
@@ -1043,7 +1467,7 @@ export default function App() {
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
                       event.preventDefault();
-                      void addTask();
+                      void addTask(event.metaKey || event.ctrlKey);
                     }
                   }}
                   placeholder="Agrega una tarea"
@@ -1075,11 +1499,7 @@ export default function App() {
                       onClick={() => setCompletedCollapsed((value) => !value)}
                       onContextMenu={(event) => {
                         event.preventDefault();
-                        setContextMenu({
-                          type: "completed-section",
-                          x: event.clientX,
-                          y: event.clientY,
-                        });
+                        void invoke("show_completed_context_menu");
                       }}
                       className="flex items-center gap-2 rounded-xl bg-white/[0.07] px-3 py-2 text-sm text-white/82 transition hover:bg-white/[0.1]"
                     >
@@ -1097,80 +1517,117 @@ export default function App() {
           </>
         )}
       </section>
-      {contextMenu && contextMenu.type === "task" && contextTask ? (
-        <div
-          ref={menuRef}
-          className="fixed z-50 min-w-[180px] overflow-hidden rounded-2xl border border-[#667080]/55 bg-[rgba(18,22,30,0.94)] p-1.5 shadow-[0_20px_45px_rgba(0,0,0,0.45)] backdrop-blur-[24px]"
-          style={getContextMenuPosition("task")}
-        >
-          <button
-            type="button"
-            onClick={() => void copyTaskText(contextTask.id)}
-            className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-sm text-white/84 transition hover:bg-white/[0.06]"
-          >
-            <span>Copiar</span>
-            <span>⧉</span>
-          </button>
-          {!contextTask.completed ? (
-            <button
-              type="button"
-              onClick={() => void toggleTaskImportant(contextTask.id)}
-              className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-sm text-white/84 transition hover:bg-white/[0.06]"
-            >
-              <span>
-                {contextTask.important ? "Quitar importante" : "Marcar importante"}
-              </span>
-                <span className="text-[#f5be4f]/80">!</span>
+      {settingsOpen ? (
+        <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/30 px-4 backdrop-blur-[6px]">
+          <div className="w-full max-w-[360px] rounded-[24px] border border-white/10 bg-[rgba(22,24,30,0.96)] p-5 shadow-[0_24px_60px_rgba(0,0,0,0.5)]">
+            <div className="mb-4 flex items-center justify-between">
+              <p className="text-base font-semibold text-white">Preferencias</p>
+              <button
+                type="button"
+                onClick={() => setSettingsOpen(false)}
+                className="flex h-7 w-7 items-center justify-center rounded-full text-white/55 transition hover:bg-white/[0.08] hover:text-white"
+                aria-label="Cerrar"
+              >
+                ✕
               </button>
-            ) : null}
-          <button
-            type="button"
-            onClick={() =>
-              void (contextTask.completed
-                ? markTaskAsPending(contextTask.id)
-                : markTaskAsCompleted(contextTask.id))
-            }
-            className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-sm text-white/84 transition hover:bg-white/[0.06]"
-          >
-            <span>
-              {contextTask.completed ? "Marcar incompleta" : "Marcar completada"}
-            </span>
-            <span>{contextTask.completed ? "↺" : "✓"}</span>
-          </button>
-          <div className="my-1 border-t border-white/8" />
-          <button
-            type="button"
-            onClick={() => requestDeleteTask(contextTask.id)}
-            className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-sm text-[#ffb4b4] transition hover:bg-white/[0.06]"
-          >
-            <span>Eliminar tarea</span>
-            <span>⌫</span>
-          </button>
-        </div>
-      ) : null}
-      {contextMenu && contextMenu.type === "completed-section" ? (
-        <div
-          ref={menuRef}
-          className="fixed z-50 min-w-[220px] overflow-hidden rounded-2xl border border-[#667080]/55 bg-[rgba(18,22,30,0.94)] p-1.5 shadow-[0_20px_45px_rgba(0,0,0,0.45)] backdrop-blur-[24px]"
-          style={getContextMenuPosition("completed-section")}
-        >
-          <button
-            type="button"
-            onClick={() => void markAllCompletedAsPending()}
-            className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-sm text-white/84 transition hover:bg-white/[0.06]"
-          >
-            <span>Marcar todas incompletas</span>
-            <span>↺</span>
-          </button>
-          <div className="my-1 border-t border-white/8" />
-          <button
-            type="button"
-            onClick={() => requestDeleteCompletedTasks()}
-            className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-sm text-[#ffb4b4] transition hover:bg-white/[0.06]"
-          >
-            <span>Eliminar completadas</span>
-            <span>⌫</span>
-          </button>
+            </div>
+
+            <div className="space-y-1">
+              <button
+                type="button"
+                onClick={() => void toggleHideOnBlur(!settings.hideOnBlur)}
+                className="flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm text-white/85 transition hover:bg-white/[0.05]"
+              >
+                <span>
+                  Ocultar al perder foco
+                  <span className="mt-0.5 block text-xs text-white/40">
+                    Se esconde al cambiar de app (tipo Spotlight)
+                  </span>
+                </span>
+                <span
+                  className={`relative h-5 w-9 shrink-0 rounded-full transition ${
+                    settings.hideOnBlur ? "bg-[#f5be4f]" : "bg-white/15"
+                  }`}
+                >
+                  <span
+                    className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
+                      settings.hideOnBlur ? "left-[18px]" : "left-0.5"
+                    }`}
+                  />
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void toggleAutostart(!settings.autostart)}
+                className="flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm text-white/85 transition hover:bg-white/[0.05]"
+              >
+                <span>Iniciar con el sistema</span>
+                <span
+                  className={`relative h-5 w-9 shrink-0 rounded-full transition ${
+                    settings.autostart ? "bg-[#f5be4f]" : "bg-white/15"
+                  }`}
+                >
+                  <span
+                    className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
+                      settings.autostart ? "left-[18px]" : "left-0.5"
+                    }`}
+                  />
+                </span>
+              </button>
+            </div>
+
+            <div className="mt-4 px-3">
+              <p className="mb-2 text-xs uppercase tracking-[0.2em] text-white/35">
+                Atajo global
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {SHORTCUT_PRESETS.map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    onClick={() => void changeShortcut(preset)}
+                    className={`rounded-full border px-3 py-1.5 text-xs transition ${
+                      settings.shortcut === preset
+                        ? "border-[#f5be4f]/60 bg-[#f5be4f]/15 text-white"
+                        : "border-white/10 bg-white/[0.04] text-white/70 hover:bg-white/[0.08]"
+                    }`}
+                  >
+                    {preset}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="mt-5 border-t border-white/8 px-3 pt-4">
+              <p className="mb-2 text-xs uppercase tracking-[0.2em] text-white/35">
+                Datos
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => void exportTasks("json")}
+                  className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-xs text-white/80 transition hover:bg-white/[0.08]"
+                >
+                  Exportar JSON
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void exportTasks("markdown")}
+                  className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-xs text-white/80 transition hover:bg-white/[0.08]"
+                >
+                  Exportar Markdown
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void importTasks()}
+                  className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-xs text-white/80 transition hover:bg-white/[0.08]"
+                >
+                  Importar JSON
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       ) : null}
       {deleteConfirm ? (
@@ -1224,6 +1681,18 @@ export default function App() {
             <path d="M7 15H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2v1" />
           </svg>
           <span>Copiado al portapapeles</span>
+        </div>
+      ) : null}
+      {undoVisible ? (
+        <div className="fixed bottom-5 left-1/2 z-[70] flex -translate-x-1/2 items-center gap-3 rounded-full border border-white/10 bg-[rgba(18,22,30,0.94)] py-1.5 pl-4 pr-1.5 text-xs text-white/82 shadow-[0_16px_40px_rgba(0,0,0,0.32)] backdrop-blur-[18px]">
+          <span>Tarea eliminada</span>
+          <button
+            type="button"
+            onClick={() => void undoDelete()}
+            className="rounded-full bg-white/[0.1] px-3 py-1 text-xs font-medium text-white transition hover:bg-white/[0.16]"
+          >
+            Deshacer
+          </button>
         </div>
       ) : null}
     </main>
